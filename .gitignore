@@ -1,0 +1,20 @@
+# Dependencies and builds
+node_modules/
+dist/
+.turbo/
+coverage/
+
+# Local runtime state
+.env
+.env.*
+!.env.example
+*.log
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local test uploads and generated assets
+tmp/
+uploads/

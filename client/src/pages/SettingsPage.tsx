@@ -3,21 +3,25 @@
  * Model provider, API keys, preferences, and profile/about text.
  * Editorial off-white canvas, warm ink type.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { KeyRound, Bot, User, Bell, Palette, Globe2, Save } from "lucide-react";
 import { toast } from "sonner";
 import DiscoverLayout from "@/components/DiscoverLayout";
+import { useApiSession } from "@/contexts/ApiSessionContext";
 
 export default function SettingsPage() {
-  const [modelProvider, setModelProvider] = useState("openai");
+  const { api, session, saveSession, clearSession } = useApiSession();
+  const [modelProvider, setModelProvider] = useState("opencode");
+  const [modelId, setModelId] = useState("deepseek-v4-flash-free");
   const [temperature, setTemperature] = useState("0.7");
   const [maxTokens, setMaxTokens] = useState("4096");
   const [apiKeys, setApiKeys] = useState<Record<string, string>>({
-    openai: "",
-    anthropic: "",
-    google: "",
-    openrouter: "",
+    opencode: "",
   });
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [accountName, setAccountName] = useState("");
+  const [hasSavedKey, setHasSavedKey] = useState(false);
   const [userName, setUserName] = useState("Avery Morgan");
   const [workspaceName, setWorkspaceName] = useState("Personal workspace");
   const [aboutText, setAboutText] = useState(
@@ -29,10 +33,47 @@ export default function SettingsPage() {
   const [darkMode, setDarkMode] = useState(false);
   const [compactLayout, setCompactLayout] = useState(false);
 
-  const handleSaveApiKey = (provider: string) => {
-    toast.message(`${provider} API key saved.`, {
-      description: "The key is stored locally in this prototype.",
-    });
+  useEffect(() => {
+    if (!session || !api.configured) return;
+    void api.getProviderSettings().then(({ providers }) => {
+      const current = providers.find((provider) => provider.provider === "opencode");
+      if (current) {
+        setModelId(current.modelId);
+        setHasSavedKey(current.hasApiKey);
+      }
+    }).catch(() => undefined);
+  }, [api, session]);
+
+  const handleAccount = async (mode: "login" | "register") => {
+    if (!api.configured) {
+      toast.error("Add VITE_API_BASE_URL before connecting an account.");
+      return;
+    }
+    try {
+      const nextSession = mode === "register"
+        ? await api.register({ name: accountName || email.split("@")[0] || "Snappy user", email, password })
+        : await api.login({ email, password });
+      saveSession(nextSession);
+      setPassword("");
+      toast.success(mode === "register" ? "Account created and connected." : "Signed in to your workspace.");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Account connection failed.");
+    }
+  };
+
+  const handleSaveApiKey = async () => {
+    if (!session) {
+      toast.error("Sign in before saving a model configuration.");
+      return;
+    }
+    try {
+      const { provider } = await api.saveOpenCodeSettings({ modelId, apiKey: apiKeys.opencode || undefined });
+      setApiKeys({ opencode: "" });
+      setHasSavedKey(provider.hasApiKey);
+      toast.success("OpenCode configuration saved securely.", { description: "The key is encrypted by the API and is never written to this browser’s persistent storage." });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not save the OpenCode configuration.");
+    }
   };
 
   const handleSaveProfile = () => {
@@ -42,6 +83,22 @@ export default function SettingsPage() {
   return (
     <DiscoverLayout page="settings">
       <div className="max-w-2xl">
+        <section className="settings-section">
+          <span className="settings-section-label flex items-center gap-2"><User size={12} /> Account connection</span>
+          {session ? (
+            <div className="settings-field">
+              <span className="settings-field-hint">This browser is connected with a short-lived workspace session.</span>
+              <button type="button" className="api-key-save mt-3" onClick={() => { clearSession(); toast.message("Signed out of this browser."); }}>Sign out</button>
+            </div>
+          ) : (
+            <div className="grid gap-3 sm:grid-cols-2">
+              <input className="settings-input" placeholder="Name (for a new account)" value={accountName} onChange={(event) => setAccountName(event.target.value)} />
+              <input className="settings-input" type="email" placeholder="Email" value={email} onChange={(event) => setEmail(event.target.value)} />
+              <input className="settings-input sm:col-span-2" type="password" minLength={12} placeholder="Password (12+ characters)" value={password} onChange={(event) => setPassword(event.target.value)} />
+              <div className="flex gap-2 sm:col-span-2"><button type="button" className="api-key-save" onClick={() => void handleAccount("login")}>Sign in</button><button type="button" className="api-key-save" onClick={() => void handleAccount("register")}>Create account</button></div>
+            </div>
+          )}
+        </section>
         {/* Model */}
         <section className="settings-section">
           <span className="settings-section-label flex items-center gap-2">
@@ -58,15 +115,17 @@ export default function SettingsPage() {
               value={modelProvider}
               onChange={(e) => setModelProvider(e.target.value)}
             >
-              <option value="openai">OpenAI (GPT-4o)</option>
-              <option value="anthropic">Anthropic (Claude)</option>
-              <option value="google">Google (Gemini)</option>
-              <option value="openrouter">OpenRouter (multi-model)</option>
-              <option value="local">Local (Ollama)</option>
+              <option value="opencode">OpenCode Zen</option>
             </select>
             <span className="settings-field-hint">
-              Select the primary model provider for agent responses. API keys are configured below.
+              The platform initially routes runs through OpenCode Zen. Additional providers can be added behind the same encrypted server-side configuration boundary.
             </span>
+          </div>
+
+          <div className="settings-field">
+            <label className="settings-field-label" htmlFor="model-id">Model</label>
+            <input id="model-id" className="settings-input" value={modelId} onChange={(event) => setModelId(event.target.value)} />
+            <span className="settings-field-hint">Example: <code>deepseek-v4-flash-free</code>. The server validates and uses this model for new agent runs.</span>
           </div>
 
           <div className="settings-field">
@@ -121,12 +180,12 @@ export default function SettingsPage() {
                   value={value}
                   onChange={(e) => setApiKeys((prev) => ({ ...prev, [provider]: e.target.value }))}
                 />
-                <button type="button" className="api-key-save" onClick={() => handleSaveApiKey(provider)}>
+                <button type="button" className="api-key-save" onClick={() => void handleSaveApiKey()}>
                   Save
                 </button>
               </div>
               <span className="settings-field-hint">
-                Keys are stored locally in this prototype. Connect a backend to encrypt them.
+                {hasSavedKey ? "A key is already encrypted in your workspace. Enter a replacement only to rotate it." : "Keys are sent directly to the API over HTTPS and encrypted before storage."}
               </span>
             </div>
           ))}

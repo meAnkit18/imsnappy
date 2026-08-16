@@ -1,0 +1,98 @@
+# I’m Snappy Render Blueprint. Deploy all services in one region and workspace to use Render private networking.
+services:
+  - type: web
+    runtime: node
+    name: imsnappy-api
+    region: singapore
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter @imsnappy/contracts build && pnpm --filter @imsnappy/api build
+    startCommand: pnpm --filter @imsnappy/api start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 4100
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: imsnappy
+      - key: JWT_ACCESS_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: CONFIG_ENCRYPTION_KEY
+        generateValue: true
+      - key: INTERNAL_SERVICE_TOKEN
+        generateValue: true
+      - key: HARNESS_BASE_URL
+        sync: false
+      - key: CLIENT_ORIGIN
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+
+  - type: pserv
+    runtime: node
+    name: imsnappy-harness
+    region: singapore
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter @imsnappy/contracts build && pnpm --filter @imsnappy/harness build
+    startCommand: pnpm --filter @imsnappy/harness start
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 4200
+      - key: INTERNAL_SERVICE_TOKEN
+        sync: false
+      - key: OPENCODE_API_KEY
+        sync: false
+      - key: OPENCODE_BASE_URL
+        value: https://opencode.ai/zen/v1
+      - key: E2B_API_KEY
+        sync: false
+      - key: E2B_TEMPLATE
+        value: base
+      - key: AGENT_MAX_TOOL_ROUNDS
+        value: 4
+      - key: AGENT_MAX_COMMAND_TIMEOUT_MS
+        value: 60000
+      - key: AGENT_REQUEST_TIMEOUT_MS
+        value: 300000
+
+  - type: worker
+    runtime: node
+    name: imsnappy-orchestrator
+    region: singapore
+    buildCommand: pnpm install --frozen-lockfile && pnpm --filter @imsnappy/contracts build && pnpm --filter @imsnappy/orchestrator build
+    startCommand: pnpm --filter @imsnappy/orchestrator start
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: imsnappy
+      - key: HARNESS_BASE_URL
+        sync: false
+      - key: INTERNAL_SERVICE_TOKEN
+        sync: false
+      - key: ORCHESTRATOR_POLL_INTERVAL_MS
+        value: 30000
+      - key: ORCHESTRATOR_LEASE_MS
+        value: 900000
+      - key: ORCHESTRATOR_MAX_ATTEMPTS
+        value: 3
+      - key: ORCHESTRATOR_MAX_BATCH_SIZE
+        value: 20

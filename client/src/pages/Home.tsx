@@ -5,6 +5,8 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import Sidebar from "@/components/Sidebar";
+import { useApiSession } from "@/contexts/ApiSessionContext";
+import type { StreamEvent } from "@/lib/api";
 import {
   ArrowUp,
   AtSign,
@@ -110,7 +112,9 @@ function Bloom({ className }: { className: string }) {
 }
 
 export default function Home() {
+  const { api, session } = useApiSession();
   const [selectedConversation, setSelectedConversation] = useState("brief");
+  const [remoteConversationId, setRemoteConversationId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [submittedPrompt, setSubmittedPrompt] = useState("");
   const [isWorking, setIsWorking] = useState(false);
@@ -132,16 +136,6 @@ export default function Home() {
     return () => window.clearInterval(timer);
   }, []);
 
-  useEffect(() => {
-    if (!isWorking) return;
-    const timer = window.setTimeout(() => {
-      setIsWorking(false);
-      setShowResponse(true);
-      setMessages((history) => history.map((entry) => (entry.isWorking ? { ...entry, isWorking: false } : entry)));
-    }, 1150);
-    return () => window.clearTimeout(timer);
-  }, [isWorking]);
-
   const resetConversation = () => {
     setDraft("");
     setSubmittedPrompt("");
@@ -150,10 +144,33 @@ export default function Home() {
     setIsWorking(false);
     setTraceExpanded(false);
     setSelectedConversation("brief");
+    setRemoteConversationId(null);
     setMobileRailOpen(false);
   };
 
-  const submitPrompt = (prompt = draft) => {
+  const settleAgentMessage = (text: string) => {
+    setMessages((history) => history.map((entry) => (entry.isWorking ? { ...entry, text, isWorking: false } : entry)));
+    setIsWorking(false);
+    setShowResponse(true);
+  };
+
+  const applyRunEvent = (event: StreamEvent) => {
+    if (event.type === "run.delta") {
+      const text = typeof event.payload.text === "string" ? event.payload.text : "";
+      setMessages((history) => history.map((entry) => (entry.isWorking ? { ...entry, text: `${entry.text}${text}` } : entry)));
+      return;
+    }
+    if (event.type === "run.completed") {
+      settleAgentMessage("The agent completed this run without a text response.");
+      return;
+    }
+    if (event.type === "run.failed" || event.type === "run.cancelled") {
+      const message = typeof event.payload.message === "string" ? event.payload.message : "This agent run did not complete.";
+      settleAgentMessage(message);
+    }
+  };
+
+  const submitPrompt = async (prompt = draft) => {
     const cleanPrompt = prompt.trim();
     if (!cleanPrompt) {
       toast.message("Give the agent a little direction first.");
@@ -170,6 +187,25 @@ export default function Home() {
     setShowResponse(false);
     setTraceExpanded(false);
     setSelectedConversation("brief");
+
+    if (api.configured && session) {
+      try {
+        const conversationId = remoteConversationId ?? (await api.createConversation(cleanPrompt.slice(0, 80))).conversation.id;
+        setRemoteConversationId(conversationId);
+        const { run } = await api.sendMessage(conversationId, { text: cleanPrompt, allowSandbox: agentMode });
+        await api.streamRun(run.id, applyRunEvent);
+        return;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "The connected agent service could not start this run.";
+        toast.error("The live agent service is unavailable.", { description: detail });
+        settleAgentMessage("The connected service is unavailable. The local workspace preview is still ready for your next direction.");
+        return;
+      }
+    }
+
+    window.setTimeout(() => {
+      settleAgentMessage("I’d start by separating the useful signal from the surrounding noise, then structure the result as a brief with evidence, choices, and an actionable next move.");
+    }, 1150);
   };
 
   const chooseConversation = (id: string) => {
@@ -359,6 +395,7 @@ function ConversationView({
   onTryAgain: () => void;
   messages?: AgentMessage[];
 }) {
+  const latestAssistantMessage = [...messages].reverse().find((message) => message.role === "agent" && !message.isWorking)?.text;
   return (
     <div className="animate-editorial-in mx-auto w-full max-w-[700px] pb-10 pt-4">
       <div className="flex items-start gap-4">
@@ -377,8 +414,8 @@ function ConversationView({
             <>
               <p className="agent-response-label">I’m Snappy</p>
               <h2 className="display-subtitle mt-3">Here’s the shape I’d give this work.</h2>
-              <p className="mt-5 max-w-[600px] text-[15px] leading-7 text-[#4e4e4e]">
-                I’d start by separating the useful signal from the surrounding noise, then structure the result as a brief with evidence, choices, and an actionable next move.
+              <p className="mt-5 max-w-[600px] whitespace-pre-wrap text-[15px] leading-7 text-[#4e4e4e]">
+                {latestAssistantMessage ?? "I’d start by separating the useful signal from the surrounding noise, then structure the result as a brief with evidence, choices, and an actionable next move."}
               </p>
 
               <button type="button" onClick={onToggleTrace} className="work-trace-button mt-7">
@@ -641,8 +678,8 @@ function CanvasConversationPanel({
                         <span className="agent-pulse-small"><i /><i /><i /></span>
                         <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-[#777169]">I’m Snappy</span>
                       </div>
-                      <p className="mt-2 text-[13px] leading-6 text-[#292524]">
-                        I’d start by separating the useful signal from the surrounding noise, then structure the result as a brief with evidence, choices, and an actionable next move.
+                      <p className="mt-2 whitespace-pre-wrap text-[13px] leading-6 text-[#292524]">
+                        {message.text || "The agent is preparing a response."}
                       </p>
                       <button type="button" onClick={onToggleTrace} className="canvas-work-trace mt-4">
                         <span className="trace-live-dot" />
@@ -682,5 +719,3 @@ function CanvasConversationPanel({
     </aside>
   );
 }
-
-

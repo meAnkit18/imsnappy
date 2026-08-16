@@ -1,132 +1,167 @@
 /**
- * I'm Snappy — Library page
- * Generated-assets storage: documents, images, audio, video, and files.
- * Editorial off-white canvas, warm ink type.
+ * I’m Snappy — Library page
+ * Editorial off-white asset cabinet backed by signed storage uploads and private API records.
  */
-import { useState } from "react";
-import { FileText, Image, Music, Video, FolderOpen, Download, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Captions, Download, FileText, FolderOpen, Image, LoaderCircle, Music, Trash2, Upload, Video } from "lucide-react";
 import { toast } from "sonner";
 import DiscoverLayout from "@/components/DiscoverLayout";
+import { type ArtifactType, type LibraryArtifact } from "@/lib/api";
+import { useApiSession } from "@/contexts/ApiSessionContext";
 
-type LibraryAsset = {
-  id: string;
-  name: string;
-  type: "document" | "image" | "audio" | "video" | "file";
-  size: string;
-  date: string;
-  source: string;
-};
-
-const assets: LibraryAsset[] = [
-  { id: "a1", name: "Launch brief — final draft", type: "document", size: "12 KB", date: "Today, 4:12 AM", source: "A thoughtful launch brief" },
-  { id: "a2", name: "Atlas research synthesis", type: "document", size: "34 KB", date: "Yesterday", source: "Atlas research synthesis" },
-  { id: "a3", name: "Journal cover concept v2", type: "image", size: "2.4 MB", date: "Thu, 11:30 PM", source: "Grid systems for a new journal" },
-  { id: "a4", name: "Partner letter — batch export", type: "document", size: "8 KB", date: "Tue, 9:05 AM", source: "Three partner letters" },
-  { id: "a5", name: "Brand palette reference", type: "image", size: "1.1 MB", date: "Mon, 2:45 PM", source: "Atlas research synthesis" },
-  { id: "a6", name: "Narration draft — intro segment", type: "audio", size: "4.8 MB", date: "Sun, 6:20 PM", source: "A thoughtful launch brief" },
-  { id: "a7", name: "Editorial layout mockup", type: "image", size: "3.2 MB", date: "Sat, 10:15 AM", source: "Grid systems for a new journal" },
-  { id: "a8", name: "Project recap — short film", type: "video", size: "18.6 MB", date: "Fri, 7:33 PM", source: "Atlas research synthesis" },
-  { id: "a9", name: "Voice note — design direction", type: "audio", size: "2.1 MB", date: "Thu, 3:10 PM", source: "Grid systems for a new journal" },
-  { id: "a10", name: "Data export — Q3 metrics", type: "file", size: "56 KB", date: "Wed, 1:22 AM", source: "A thoughtful launch brief" },
-  { id: "a11", name: "Typography specimen sheet", type: "image", size: "1.8 MB", date: "Tue, 8:55 PM", source: "Three partner letters" },
-  { id: "a12", name: "Ambient score — 45s loop", type: "audio", size: "3.5 MB", date: "Mon, 4:40 PM", source: "Atlas research synthesis" },
-];
-
-const typeIcons = {
+const typeIcons: Record<ArtifactType, typeof FileText> = {
   document: FileText,
   image: Image,
   audio: Music,
   video: Video,
   file: FolderOpen,
+  transcript: FileText,
 };
 
-const previewClasses = {
+const previewClasses: Record<ArtifactType, string> = {
   document: "library-preview-doc",
   image: "library-preview-image",
   audio: "library-preview-audio",
   video: "library-preview-video",
   file: "library-preview",
+  transcript: "library-preview-doc",
 };
 
-const filters = [
+const filters: Array<{ key: "all" | ArtifactType; label: string }> = [
   { key: "all", label: "All" },
   { key: "document", label: "Documents" },
   { key: "image", label: "Images" },
   { key: "audio", label: "Audio" },
   { key: "video", label: "Video" },
+  { key: "transcript", label: "Transcripts" },
   { key: "file", label: "Files" },
-] as const;
+];
+
+function inferAssetType(file: File): Exclude<ArtifactType, "transcript"> {
+  if (file.type.startsWith("image/")) return "image";
+  if (file.type.startsWith("audio/")) return "audio";
+  if (file.type.startsWith("video/")) return "video";
+  if (file.type === "application/pdf" || file.type.startsWith("text/") || file.type.includes("document")) return "document";
+  return "file";
+}
+
+function formatBytes(bytes?: number): string {
+  if (!bytes) return "Stored asset";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Recently" : date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
 
 export default function LibraryPage() {
-  const [activeFilter, setActiveFilter] = useState<string>("all");
+  const { api, session } = useApiSession();
+  const [activeFilter, setActiveFilter] = useState<"all" | ArtifactType>("all");
+  const [artifacts, setArtifacts] = useState<LibraryArtifact[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [transcribingId, setTranscribingId] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
-  const filtered = assets.filter((asset) => activeFilter === "all" || asset.type === activeFilter);
-
-  const handleDownload = (name: string) => {
-    toast.message(`Downloading ${name}…`, { description: "Save location will open when storage is connected." });
+  const refresh = async () => {
+    if (!api.configured || !session) return;
+    setLoading(true);
+    try {
+      const { artifacts: nextArtifacts } = await api.listArtifacts();
+      setArtifacts(nextArtifacts);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not load the Library.");
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const handleDelete = (name: string) => {
-    toast.message(`${name} removed from Library.`, { description: "This prototype keeps assets local for now." });
+  useEffect(() => { void refresh(); }, [api, session]);
+
+  const handleFile = async (file?: File) => {
+    if (!file) return;
+    if (!session) { toast.error("Sign in in Settings before uploading to your Library."); return; }
+    setUploading(true);
+    try {
+      const artifact = await api.uploadArtifact(file, inferAssetType(file));
+      setArtifacts((current) => [artifact, ...current]);
+      toast.success(`${file.name} is now in your Library.`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not upload this asset.");
+    } finally {
+      setUploading(false);
+      if (inputRef.current) inputRef.current.value = "";
+    }
   };
+
+  const handleDelete = async (artifact: LibraryArtifact) => {
+    try {
+      await api.deleteArtifact(artifact.id);
+      setArtifacts((current) => current.filter((item) => item.id !== artifact.id));
+      toast.message(`${artifact.name} removed from Library.`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not remove this asset.");
+    }
+  };
+
+  const handleTranscribe = async (artifact: LibraryArtifact) => {
+    if (!artifact.secureUrl) { toast.error("This asset is not available for transcription."); return; }
+    try {
+      setTranscribingId(artifact.id);
+      const source = await fetch(artifact.secureUrl);
+      if (!source.ok) throw new Error("Could not retrieve the stored media for transcription.");
+      const blob = await source.blob();
+      const result = await api.transcribeMedia(new File([blob], artifact.name, { type: artifact.contentType }));
+      setArtifacts((current) => [result.artifact, ...current]);
+      toast.success("Transcript saved to Library.", { description: result.transcript.text ? "A text transcript is ready for your agent workflows." : "The transcription provider completed the request." });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not transcribe this asset.");
+    } finally {
+      setTranscribingId(null);
+    }
+  };
+
+  const filtered = artifacts.filter((asset) => activeFilter === "all" || asset.type === activeFilter);
 
   return (
     <DiscoverLayout page="library">
-      <div className="library-filter-tabs">
-        {filters.map((filter) => (
-          <button
-            key={filter.key}
-            type="button"
-            onClick={() => setActiveFilter(filter.key)}
-            className={`library-filter-tab ${activeFilter === filter.key ? "library-filter-tab-active" : ""}`}
-          >
-            {filter.label}
-          </button>
-        ))}
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+        <div className="library-filter-tabs">
+          {filters.map((filter) => <button key={filter.key} type="button" onClick={() => setActiveFilter(filter.key)} className={`library-filter-tab ${activeFilter === filter.key ? "library-filter-tab-active" : ""}`}>{filter.label}</button>)}
+        </div>
+        <label className="api-key-save flex cursor-pointer items-center gap-2">
+          {uploading ? <LoaderCircle size={14} className="animate-spin" /> : <Upload size={14} />}
+          {uploading ? "Uploading" : "Upload asset"}
+          <input ref={inputRef} className="sr-only" type="file" disabled={uploading} onChange={(event) => void handleFile(event.target.files?.[0])} />
+        </label>
       </div>
 
-      <div className="library-grid">
+      {!api.configured && <p className="mb-6 text-[13px] text-[#8a857d]">Set <code>VITE_API_BASE_URL</code> to connect this Library to your I’m Snappy service.</p>}
+      {api.configured && !session && <p className="mb-6 text-[13px] text-[#8a857d]">Sign in through Settings to access your private Library.</p>}
+      {loading && <div className="flex items-center gap-2 py-10 text-[13px] text-[#8a857d]"><LoaderCircle size={15} className="animate-spin" /> Loading Library…</div>}
+
+      {!loading && session && <div className="library-grid">
         {filtered.map((asset) => {
           const Icon = typeIcons[asset.type];
-          return (
-            <div key={asset.id} className="library-card">
-              <div className={`library-preview ${previewClasses[asset.type]}`}>
-                <Icon size={28} strokeWidth={1.5} />
-              </div>
-              <div className="library-card-info">
-                <span className="library-card-name">{asset.name}</span>
-                <span className="library-card-meta">
-                  {asset.size} · {asset.date}
-                </span>
-                <div className="mt-2 flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => handleDownload(asset.name)}
-                    className="icon-button h-7 w-7"
-                    aria-label={`Download ${asset.name}`}
-                  >
-                    <Download size={13} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleDelete(asset.name)}
-                    className="icon-button h-7 w-7"
-                    aria-label={`Delete ${asset.name}`}
-                  >
-                    <Trash2 size={13} />
-                  </button>
-                </div>
+          return <div key={asset.id} className="library-card">
+            <div className={`library-preview ${previewClasses[asset.type]}`}><Icon size={28} strokeWidth={1.5} /></div>
+            <div className="library-card-info">
+              <span className="library-card-name">{asset.name}</span>
+              <span className="library-card-meta">{formatBytes(asset.bytes)} · {formatDate(asset.createdAt)}</span>
+              <div className="mt-2 flex items-center gap-2">
+                {asset.secureUrl && <button type="button" onClick={() => window.open(asset.secureUrl, "_blank", "noopener,noreferrer")} className="icon-button h-7 w-7" aria-label={`Download ${asset.name}`}><Download size={13} /></button>}
+                {(asset.type === "audio" || asset.type === "video") && <button type="button" disabled={transcribingId === asset.id} onClick={() => void handleTranscribe(asset)} className="icon-button h-7 w-7" aria-label={`Transcribe ${asset.name}`}>{transcribingId === asset.id ? <LoaderCircle size={13} className="animate-spin" /> : <Captions size={13} />}</button>}
+                <button type="button" onClick={() => void handleDelete(asset)} className="icon-button h-7 w-7" aria-label={`Delete ${asset.name}`}><Trash2 size={13} /></button>
               </div>
             </div>
-          );
+          </div>;
         })}
-      </div>
+      </div>}
 
-      {filtered.length === 0 && (
-        <p className="mt-12 text-center text-[13px] text-[#8a857d]">
-          Nothing stored in this category yet. Generated assets will appear here.
-        </p>
-      )}
+      {!loading && session && filtered.length === 0 && <p className="mt-12 text-center text-[13px] text-[#8a857d]">Nothing stored in this category yet. Upload an asset or save one from an agent run.</p>}
     </DiscoverLayout>
   );
 }
