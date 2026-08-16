@@ -4,6 +4,22 @@ I’m Snappy is a deployable cloud-agent workspace with a React/Vite browser cli
 
 > **Security boundary.** Browser code holds only a short-lived authenticated session. Provider credentials, Cloudinary signing secrets, the MongoDB URI, E2B sandbox identifiers, and service-to-service tokens remain server-side. The API encrypts user-supplied provider credentials before persistence.
 
+## Repository layout
+
+```text
+imsnappy/
+├── client/                  # One Vercel project: browser application
+├── services/
+│   ├── api/                 # One Render Web Service: public API
+│   ├── harness/             # One Render Private Service: OpenCode + E2B execution
+│   └── orchestrator/        # One Render Background Worker: durable schedules
+├── packages/contracts/      # Shared TypeScript request and stream types
+├── render.yaml              # Blueprint that provisions the three Render projects
+└── README.md                # Environment handoff and production smoke test
+```
+
+The client and every server process are deliberately isolated so that each can be deployed, restarted, and scaled independently. See [`services/README.md`](./services/README.md) for the per-service project map, then use the deployment steps below to connect them through the public API and Render private network.
+
 ## Service topology
 
 ```mermaid
