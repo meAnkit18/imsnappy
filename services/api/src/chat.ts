@@ -1,6 +1,6 @@
 import type { Express, Request, Response } from "express";
 import { z } from "zod";
-import { runAgent, type ModelMessage } from "./agent";
+import { runAgent, type ModelMessage } from "./agent.js";
 
 const streamInput = z.object({
   modelId: z.string().min(1).max(128),
@@ -21,7 +21,7 @@ const streamInput = z.object({
   allowSandbox: z.boolean().optional().default(true),
 });
 
-const SYSTEM_PROMPT = `You are Snappy, a focused AI agent workspace assistant. You are helpful, concise, and proactive. When the user asks for information, analysis, code, or summaries, respond directly. If they ask you to build a browser game, UI, prototype, or small website, use create_web_preview to make a complete self-contained HTML artifact; it will open automatically in Canvas for the user to interact with. If they ask you to verify, count, list, compare, transform, or compute something concrete, use the run_command tool in an isolated sandbox — prefer small, safe, read-friendly commands. Always explain what you are doing briefly before acting. Write responses in clean markdown where helpful.`;
+const SYSTEM_PROMPT = `You are Snappy, a focused AI agent workspace assistant. You are helpful, concise, and proactive. When the user asks for information, analysis, code, or summaries, respond directly. For multi-step coding or file work, first inspect the reusable agent workspace with list_files or read_file, then use write_file for exact source content, and run_command only to test or inspect that workspace. The workspace persists for every tool call in this run, but is cleaned up when the run ends. Use create_web_preview for a small website, UI, prototype, game, or browser experience when a self-contained HTML artifact is appropriate; it opens automatically in Canvas. Tool results are evidence: if an action fails, inspect the safe error and repair the plan rather than repeating it blindly. Do not claim a file was created, tested, or previewed unless its tool result confirms it. Always explain completed work briefly and write responses in clean markdown where helpful.`;
 
 export function registerChatStream(app: Express) {
   app.post("/api/chat/stream", async (req: Request, res: Response) => {
@@ -38,7 +38,13 @@ export function registerChatStream(app: Express) {
     res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders?.();
 
+    let finished = false;
+
+    // IncomingMessage can report destroyed after its request body is consumed;
+    // an SSE response remains valid until the response itself closes.
+    const clientIsGone = () => res.destroyed || res.writableEnded;
     const send = (type: string, payload: Record<string, unknown>) => {
+      if (clientIsGone()) return;
       const data = JSON.stringify({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, type, occurredAt: new Date().toISOString(), payload });
       res.write(`data: ${data}\n\n`);
     };
@@ -50,7 +56,6 @@ export function registerChatStream(app: Express) {
       ...input.messages.map(m => ({ ...m, role: m.role === "agent" ? "assistant" : m.role } as ModelMessage)),
     ];
 
-    let finished = false;
     try {
       await runAgent({
         modelId: input.modelId,
@@ -70,23 +75,28 @@ export function registerChatStream(app: Express) {
           else if (event.type === "completed") {
             finished = true;
             send("run.completed", {});
-            res.write(": done\n\n");
-            res.end();
+            if (!clientIsGone()) {
+              res.write(": done\n\n");
+              res.end();
+            }
           }
         },
       });
       if (!finished) {
         send("run.completed", {});
-        res.write(": done\n\n");
-        res.end();
+        if (!clientIsGone()) {
+          res.write(": done\n\n");
+          res.end();
+        }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (!finished) {
+      if (!finished && !clientIsGone()) {
         send("run.failed", { message: message.slice(0, 500) });
         res.write(": failed\n\n");
         res.end();
       }
+    } finally {
     }
   });
 }

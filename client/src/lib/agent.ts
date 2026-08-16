@@ -16,6 +16,7 @@ export const OPENCODE_ZEN_URL = import.meta.env.DEV
   : "https://opencode.ai/zen/v1/chat/completions";
 
 export const FREE_MODELS = [
+  { id: "laguna-s-2.1-free", label: "Laguna S 2.1 (free)" },
   { id: "hy3-free", label: "Hy 3 Free" },
   { id: "nemotron-3.5-lightning-free", label: "Nemotron 3.5 Lightning (free)" },
   { id: "nemotron-3-ultra-free", label: "Nemotron 3 Ultra (free)" },

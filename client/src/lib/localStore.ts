@@ -124,7 +124,7 @@ export function saveSchedules(tasks: ScheduledTask[]): void {
 export function defaultPreferences(): AgentPreferences {
   return {
     provider: "opencode-zen",
-    model: "hy3-free",
+    model: "laguna-s-2.1-free",
     temperature: 0.6,
     maxTokens: 1024,
     aboutText: "",
@@ -138,8 +138,8 @@ export function defaultPreferences(): AgentPreferences {
 export function readPreferences(): AgentPreferences {
   const stored = read<Partial<AgentPreferences>>(KEYS.preferences, {});
   const merged = { ...defaultPreferences(), ...stored };
-  // Older previews persisted a rate-limited model; map it to the healthy default.
-  if (merged.model === "deepseek-v4-flash-free") merged.model = "hy3-free";
+  // Older previews persisted a rate-limited model; map it to the responsive default.
+  if (merged.model === "deepseek-v4-flash-free") merged.model = "laguna-s-2.1-free";
   return merged;
 }
 

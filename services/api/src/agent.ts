@@ -1,16 +1,22 @@
 /**
- * Server-side agent runtime for the local preview.
+ * Server-side agent runtime for I’m Snappy.
  *
- * Streams completions from OpenCode Zen, detects tool calls when the model
- * emits them, executes policy-approved commands in short-lived E2B sandboxes,
- * and continues the conversation with tool results. Sandbox IDs are never
- * exposed to the browser; everything is delivered as typed trace events.
+ * Model calls, typed tool dispatch, and live events remain server-owned. Tool
+ * calls in a run share a bounded E2B workspace so the agent can build and
+ * inspect multi-file work across steps without exposing sandbox IDs to clients.
  */
 
-import { Sandbox } from "e2b";
-import { buildSnakeGameHtml, createSandboxPreview, isSnakeGameRequest } from "./preview";
+import {
+  AgentWorkspace,
+  executeAgentTool,
+  getModelTools,
+  type AgentToolCall,
+} from "./agentTools.js";
+import { invokeLLM, type Message as ForgeMessage, type ToolCall as ForgeToolCall } from "./_core/llm.js";
+import { buildSnakeGameHtml, createSandboxPreview, isSnakeGameRequest } from "./preview.js";
 
 export const FREE_MODELS = [
+  { id: "laguna-s-2.1-free", label: "Laguna S 2.1 Free", free: true },
   { id: "hy3-free", label: "Hy 3 Free", free: true },
   { id: "nemotron-3.5-lightning-free", label: "Nemotron 3.5 Lightning", free: true },
   { id: "nemotron-3-ultra-free", label: "Nemotron 3 Ultra", free: true },
@@ -18,13 +24,9 @@ export const FREE_MODELS = [
   { id: "mimo-v2.5-free", label: "Mimo V2.5", free: true },
 ] as const;
 
-export const DEFAULT_MODEL = "hy3-free";
+export const DEFAULT_MODEL = "laguna-s-2.1-free";
 
-/**
- * The canonical Snake request is fulfilled before a model needs to narrate the
- * work. Keeping the final copy deterministic prevents a slow or unavailable
- * model from replacing a successful interactive result with generic prose.
- */
+/** Keeps the canonical demonstration reliable when a model is rate-limited. */
 export function previewCompletionMessage(name: string) {
   return `I created **${name.replace(/\.html$/i, "")}** in an isolated sandbox and opened it in Canvas. Click **Focus game** (or the preview itself) to play with Arrow keys or WASD. You can also use **Open** to launch the same preview in its own browser tab.`;
 }
@@ -45,26 +47,22 @@ export type TraceEvent = {
 };
 
 const ZEN_URL = "https://opencode.ai/zen/v1/chat/completions";
-const E2B_API_URL = "https://api.e2b.dev";
+const MODEL_TURN_TIMEOUT_MS = 8_000;
+const MODEL_CHUNK_IDLE_TIMEOUT_MS = 12_000;
+const MAX_OPENCODE_CANDIDATES = 2;
 
-const ALLOWED_COMMANDS = new Set([
-  "ls", "pwd", "echo", "cat", "head", "tail", "grep", "wc", "date", "whoami",
-  "uname", "hostname", "uptime", "free", "df", "env", "printenv", "which",
-  "sort", "uniq", "cut", "tr", "sed", "awk", "find", "mkdir", "touch",
-  "cp", "mv", "rm", "du", "diff", "man", "file", "stat", "seq", "factor",
-  "bc", "shuf", "comm", "yes", "printf", "tree", "xargs", "tee", "base64",
-  "od", "strings", "curl", "wget", "node", "python3", "pip3", "pip", "git",
-  "npm", "pnpm", "yarn", "jq", "zip", "unzip", "tar", "gzip", "less", "more",
-  "nano", "vim", "code", "clear", "history", "export", "alias", "sleep",
-  "test", "true", "false", "timeout", "nproc", "lscpu",
-]);
+function modelTimeoutError(modelId: string) {
+  const error = new Error(`Model ${modelId} did not produce a response within ${MODEL_TURN_TIMEOUT_MS / 1000} seconds.`) as Error & { status?: number };
+  error.status = 408;
+  return error;
+}
 
-const BANNED_PATTERNS: RegExp[] = [
-  /(^|\||&|;|\n)\s*(sudo|rm\s+-rf\s+\/|mkfs|dd\s+of=\/dev|chmod\s+777\s+\/|>)/i,
-  /\b(aws|gcloud|kubectl|docker|ssh)\b/,
-];
+function isRetryableProviderError(error: unknown) {
+  const status = (error as Error & { status?: number }).status;
+  return status === 408 || status === 429 || (typeof status === "number" && status >= 500 && status <= 599);
+}
 
-/** OpenAI-compatible message sent to the model, where assistants may carry tool calls. */
+/** OpenAI-compatible messages; assistant messages can contain tool-call protocol data. */
 export type ModelMessage =
   | { role: "system" | "user" | "tool"; content: string; toolCallId?: string; name?: string }
   | { role: "assistant"; content: string | null; tool_calls?: unknown[] };
@@ -76,95 +74,30 @@ export interface AgentOptions {
   maxTokens?: number;
   allowSandbox?: boolean;
   maxToolRounds?: number;
+  signal?: AbortSignal;
   onEvent: (event: TraceEvent) => void;
-}
-
-function isBanned(command: string): string | null {
-  for (const pattern of BANNED_PATTERNS) {
-    if (pattern.test(command)) return "Command blocked by policy";
-  }
-  return null;
-}
-
-function splitCommand(command: string): { allowed: boolean; reason?: string; parts: string[] } {
-  const clean = command.trim();
-  if (!clean) return { allowed: false, reason: "Empty command", parts: [] };
-  const banned = isBanned(clean);
-  if (banned) return { allowed: false, reason: banned, parts: [] };
-  const parts = clean.split(/\s+/);
-  const base = parts[0].replace(/^[.\//\\]+/, "");
-  if (!ALLOWED_COMMANDS.has(base)) {
-    return { allowed: false, reason: `Command "${base}" is not in the allowlist`, parts };
-  }
-  return { allowed: true, parts };
-}
-
-async function runInSandbox(command: string): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const sandbox = await Sandbox.create();
-  try {
-    const exec = await sandbox.commands.run(command, { timeoutMs: 45_000 });
-    return {
-      exitCode: exec.exitCode,
-      stdout: exec.stdout.slice(0, 8_000),
-      stderr: exec.stderr.slice(0, 4_000),
-    };
-  } finally {
-    await sandbox.kill();
-  }
 }
 
 async function streamOne(
   messages: AgentOptions["messages"],
   opts: AgentOptions,
-): Promise<{ content: string; toolCalls: { id: string; name: string; args: unknown }[] }> {
+): Promise<{ content: string; toolCalls: AgentToolCall[] }> {
+  const tools = getModelTools(opts.allowSandbox ?? false);
   const res = await fetch(ZEN_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.OPENCODE_API_KEY}`,
       "Content-Type": "application/json",
     },
+    signal: opts.signal,
     body: JSON.stringify({
       model: opts.modelId,
       messages,
       temperature: opts.temperature ?? 0.6,
       max_tokens: opts.maxTokens ?? 2048,
       stream: true,
-      tools: opts.allowSandbox
-        ? [
-            {
-              type: "function",
-              function: {
-                name: "run_command",
-                description:
-                  "Run a single read-only-friendly shell command in an isolated sandbox. Prefer small commands. Never chain destructive operations.",
-                parameters: {
-                  type: "object",
-                  properties: {
-                    command: { type: "string", description: "The shell command to run" },
-                  },
-                  required: ["command"],
-                },
-              },
-            },
-            {
-              type: "function",
-              function: {
-                name: "create_web_preview",
-                description:
-                  "Create a single-file, interactive browser preview in a persistent sandbox. Use this whenever the user asks to build a small website, UI prototype, game, or browser experience. Supply a self-contained HTML document with inline CSS and JavaScript; do not use external dependencies.",
-                parameters: {
-                  type: "object",
-                  properties: {
-                    title: { type: "string", description: "Short title for the artifact" },
-                    html: { type: "string", description: "Complete self-contained HTML document" },
-                  },
-                  required: ["title", "html"],
-                },
-              },
-            },
-          ]
-        : undefined,
-      tool_choice: opts.allowSandbox ? "auto" : undefined,
+      tools,
+      tool_choice: tools ? "auto" : undefined,
     }),
   });
 
@@ -177,254 +110,351 @@ async function streamOne(
 
   let content = "";
   const toolCallsMap = new Map<number, { id: string; name: string; args: string }>();
-  const getTc = (idx: number) => {
-    let tc = toolCallsMap.get(idx);
-    if (!tc) {
-      tc = { id: "", name: "", args: "" };
-      toolCallsMap.set(idx, tc);
+  const getToolCall = (index: number) => {
+    let toolCall = toolCallsMap.get(index);
+    if (!toolCall) {
+      toolCall = { id: "", name: "", args: "" };
+      toolCallsMap.set(index, toolCall);
     }
-    return tc;
+    return toolCall;
   };
+
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let providerFinished = false;
+  const readWithInactivityDeadline = async () => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            void reader.cancel().catch(() => undefined);
+            reject(modelTimeoutError(opts.modelId));
+          }, MODEL_CHUNK_IDLE_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  };
+  try {
+    stream: while (true) {
+      const { done, value } = await readWithInactivityDeadline();
+      if (done) break;
+      if (opts.signal?.aborted) throw new DOMException("Model request aborted", "AbortError");
+      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const data = line.startsWith("data:") ? line.slice(5).trim() : "";
+        if (!data) continue;
+        if (data === "[DONE]") {
+          providerFinished = true;
+          break stream;
+        }
+        let chunk: Record<string, unknown>;
+        try {
+          chunk = JSON.parse(data);
+        } catch {
+          continue;
+        }
+        const choices = chunk.choices as unknown[] | undefined;
+        const choice = choices?.[0] as {
+          delta?: {
+            content?: string;
+            tool_calls?: { index?: number; id?: string; function?: { name?: string; arguments?: string } }[];
+          };
+          finish_reason?: string | null;
+        } | undefined;
+        const delta = choice?.delta;
+        if (!delta) {
+          if (choice?.finish_reason) {
+            providerFinished = true;
+            break stream;
+          }
+          continue;
+        }
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-    for (const line of lines) {
-      const data = line.startsWith("data:") ? line.slice(5).trim() : "";
-      if (!data || data === "[DONE]") continue;
-      let chunk: Record<string, unknown>;
-      try {
-        chunk = JSON.parse(data);
-      } catch {
-        continue;
-      }
-      const choices = chunk.choices as unknown[] | undefined;
-      const delta = (choices?.[0] as { delta?: { content?: string; tool_calls?: { index?: number; id?: string; function?: { name?: string; arguments?: string } }[] } } | undefined)?.delta;
-      if (!delta) continue;
-      if (delta.content) {
-        content += delta.content;
-        opts.onEvent({ type: "delta", payload: { text: delta.content } });
-      }
-      if (delta.tool_calls) {
-        const deltas = delta.tool_calls as { index?: number; id?: string; function?: { name?: string; arguments?: string } }[];
-        for (const tc of deltas) {
-          const acc = getTc(tc.index ?? 0);
-          if (tc.id) acc.id = tc.id;
-          if (tc.function?.name) acc.name = tc.function.name;
-          if (tc.function?.arguments) acc.args += tc.function.arguments;
+        if (delta.content) {
+          content += delta.content;
+          opts.onEvent({ type: "delta", payload: { text: delta.content } });
+        }
+        for (const toolDelta of delta.tool_calls ?? []) {
+          const call = getToolCall(toolDelta.index ?? 0);
+          if (toolDelta.id) call.id = toolDelta.id;
+          if (toolDelta.function?.name) call.name = toolDelta.function.name;
+          if (toolDelta.function?.arguments) call.args += toolDelta.function.arguments;
+        }
+        if (choice?.finish_reason) {
+          providerFinished = true;
+          break stream;
         }
       }
     }
+  } finally {
+    if (providerFinished) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
-  reader.releaseLock();
 
   return {
     content,
-    toolCalls: Array.from(toolCallsMap.values()).map(tc => ({
-      id: tc.id || crypto.randomUUID(),
-      name: tc.name,
+    toolCalls: Array.from(toolCallsMap.values()).map(call => ({
+      id: call.id || crypto.randomUUID(),
+      name: call.name,
       args: (() => {
         try {
-          return JSON.parse(tc.args);
+          return JSON.parse(call.args);
         } catch {
-          return tc.args;
+          return call.args;
         }
       })(),
     })),
   };
 }
 
+/** Uses the platform-backed model only when the external free-model route cannot plan a turn. */
+async function invokeBuiltInFallback(
+  messages: AgentOptions["messages"],
+  opts: AgentOptions,
+): Promise<{ content: string; toolCalls: AgentToolCall[] }> {
+  const tools = getModelTools(opts.allowSandbox ?? false);
+  const forgeMessages: ForgeMessage[] = messages.map(message => {
+    if (message.role === "assistant") {
+      return {
+        role: "assistant",
+        content: message.content ?? "I requested a workspace operation and am reviewing its result.",
+      };
+    }
+    if (message.role === "tool") {
+      return {
+        role: "tool",
+        content: message.content,
+        name: message.name,
+        tool_call_id: message.toolCallId,
+      };
+    }
+    return { role: message.role, content: message.content };
+  });
+  const response = await invokeLLM({
+    messages: forgeMessages,
+    tools: tools as Parameters<typeof invokeLLM>[0]["tools"],
+    tool_choice: tools ? "auto" : undefined,
+    max_tokens: opts.maxTokens ?? 2048,
+  });
+  const completion = response.choices[0]?.message;
+  if (!completion) throw new Error("Built-in model returned no completion choices.");
+  const content = typeof completion.content === "string"
+    ? completion.content
+    : Array.isArray(completion.content)
+      ? completion.content.map(part => part.type === "text" ? part.text : "").join("")
+      : "";
+  const toolCalls = (completion.tool_calls ?? []).map((call: ForgeToolCall) => ({
+    id: call.id || crypto.randomUUID(),
+    name: call.function.name,
+    args: (() => {
+      try {
+        return JSON.parse(call.function.arguments);
+      } catch {
+        return call.function.arguments;
+      }
+    })(),
+  }));
+  if (content) opts.onEvent({ type: "delta", payload: { text: content } });
+  return { content, toolCalls };
+}
+
+function toolResultForModel(result: unknown) {
+  return JSON.stringify(result);
+}
+
 export async function runAgent(opts: AgentOptions): Promise<string> {
   const maxRounds = Math.min(opts.maxToolRounds ?? 4, 6);
   const messages = [...opts.messages];
+  const runId = crypto.randomUUID();
+  const workspace = opts.allowSandbox
+    ? new AgentWorkspace(event => opts.onEvent(event), runId)
+    : null;
   let finalContent = "";
 
-  const lastUserPrompt = [...messages].reverse().find(message => message.role === "user")?.content ?? "";
-  if (opts.allowSandbox && isSnakeGameRequest(lastUserPrompt)) {
-    const operationId = `tool-${crypto.randomUUID()}`;
-    const sandboxOperationId = `sandbox-${operationId}`;
-    opts.onEvent({ type: "tool_request", payload: { operationId, tool: "create_web_preview", args: { title: "Snake game" }, state: "running" } });
-    opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "started", purpose: "Creating a playable Snake game" } });
-    try {
-      const artifact = await createSandboxPreview({ title: "Snake game", html: buildSnakeGameHtml() });
-      opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "running", purpose: "Snake game sandbox", expiresAt: artifact.expiresAt } });
-      opts.onEvent({ type: "artifact", payload: { ...artifact, origin: "snake", kind: "web-preview" } });
-      opts.onEvent({ type: "tool_result", payload: { operationId, tool: "create_web_preview", result: { created: true, name: artifact.name }, state: "done", sandbox: true } });
-      const completion = previewCompletionMessage(artifact.name);
-      opts.onEvent({ type: "delta", payload: { text: completion } });
-      opts.onEvent({ type: "completed", payload: {} });
-      return completion;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "error", purpose: "Snake game sandbox", error: message } });
-      opts.onEvent({ type: "tool_result", payload: { operationId, tool: "create_web_preview", result: { error: message }, error: true, state: "error" } });
-    }
-  }
-
-  for (let round = 0; round <= maxRounds; round++) {
-    const modelOperationId = `model-round-${round + 1}`;
-    opts.onEvent({ type: "trace", payload: { operationId: modelOperationId, label: round === 0 ? "Understanding the request" : "Reviewing the tool result", phase: "model", kind: "model", state: "running" } });
-
-    // Try the requested model first, then fall back across the free fleet on 429.
-    const candidates = [opts.modelId, ...FREE_MODELS.map(m => m.id).filter(id => id !== opts.modelId)];
-    let lastErr: unknown = null;
-    let streamResult: { content: string; toolCalls: { id: string; name: string; args: unknown }[] } | null = null;
-    for (const candidate of candidates) {
+  try {
+    const lastUserPrompt = [...messages].reverse().find(message => message.role === "user")?.content ?? "";
+    if (opts.allowSandbox && isSnakeGameRequest(lastUserPrompt)) {
+      const operationId = `tool-${crypto.randomUUID()}`;
+      const sandboxOperationId = `sandbox-${operationId}`;
+      opts.onEvent({ type: "tool_request", payload: { operationId, tool: "create_web_preview", args: { title: "Snake game" }, state: "running" } });
+      opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "started", purpose: "Creating a playable Snake game" } });
       try {
-        streamResult = await streamOne(messages, { ...opts, modelId: candidate });
-        break;
-      } catch (err) {
-        const status = (err as Error & { status?: number }).status;
-        lastErr = err;
-        if (status !== 429) throw err; // Only retry on rate-limit; surface other errors.
+        const artifact = await createSandboxPreview({ title: "Snake game", html: buildSnakeGameHtml() });
+        opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "running", purpose: "Snake game sandbox", expiresAt: artifact.expiresAt } });
+        opts.onEvent({ type: "artifact", payload: { ...artifact, origin: "snake", kind: "web-preview" } });
+        opts.onEvent({ type: "tool_result", payload: { operationId, tool: "create_web_preview", result: { ok: true, summary: `Created ${artifact.name}.`, data: { created: true, name: artifact.name } }, state: "done", sandbox: true } });
+        const completion = previewCompletionMessage(artifact.name);
+        opts.onEvent({ type: "delta", payload: { text: completion } });
+        opts.onEvent({ type: "completed", payload: {} });
+        return completion;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "error", purpose: "Snake game sandbox", error: message } });
+        opts.onEvent({ type: "tool_result", payload: { operationId, tool: "create_web_preview", result: { ok: false, summary: message, error: { code: "preview_failed", message, retryable: true } }, error: true, state: "error" } });
       }
     }
-    if (!streamResult) throw lastErr;
-    const { content, toolCalls } = streamResult;
-    opts.onEvent({ type: "trace", payload: { operationId: modelOperationId, label: toolCalls.length > 0 ? "Prepared the next action" : "Prepared the response", phase: "model", kind: "model", state: "done" } });
 
-    if (content) {
-      messages.push({ role: "assistant", content });
-      finalContent += content;
-    }
+    for (let round = 0; round <= maxRounds; round++) {
+      const modelOperationId = `model-round-${round + 1}`;
+      opts.onEvent({ type: "trace", payload: { operationId: modelOperationId, label: round === 0 ? "Understanding the request" : "Reviewing the workspace result", phase: "model", kind: "model", state: "running" } });
 
-    if (toolCalls.length === 0) {
-      opts.onEvent({ type: "completed", payload: {} });
-      return finalContent;
-    }
+      let lastError: unknown = null;
+      let streamResult: { content: string; toolCalls: AgentToolCall[] } | null = null;
+      const useExternalStreamingProvider = process.env.SNAPPY_USE_OPENCODE_STREAM === "1";
+      const candidates = [opts.modelId, ...FREE_MODELS.map(model => model.id).filter(id => id !== opts.modelId)].slice(0, MAX_OPENCODE_CANDIDATES);
 
-    if (round === maxRounds) {
-      opts.onEvent({ type: "completed", payload: {} });
-      return finalContent;
-    }
+      if (!useExternalStreamingProvider) {
+        opts.onEvent({
+          type: "trace",
+          payload: {
+            operationId: modelOperationId,
+            label: "Planning the next action",
+            phase: "model",
+            kind: "model",
+            state: "running",
+            detail: "Using Snappy’s reliable tool-capable model route.",
+          },
+        });
+        streamResult = await invokeBuiltInFallback(messages, opts);
+      }
 
-    // Execute tool calls
-    const assistantMsg: ModelMessage = {
-      role: "assistant",
-      content: content || null,
-      tool_calls: toolCalls.map(tc => ({ id: tc.id, type: "function", function: { name: tc.name, arguments: JSON.stringify(tc.args) } })),
-    };
-    messages.push(assistantMsg);
-
-    for (const call of toolCalls) {
-      const sandboxOperationId = `sandbox-${call.id}`;
-      opts.onEvent({ type: "tool_request", payload: { operationId: call.id, tool: call.name, args: call.args, state: "running" } });
-
-      if (call.name === "create_web_preview") {
-        const args = typeof call.args === "object" && call.args !== null ? call.args as { title?: unknown; html?: unknown } : {};
-        const title = typeof args.title === "string" ? args.title : "Sandbox preview";
-        const html = typeof args.html === "string" ? args.html : "";
+      for (let candidateIndex = 0; useExternalStreamingProvider && candidateIndex < candidates.length; candidateIndex++) {
+        const candidate = candidates[candidateIndex]!;
+        opts.onEvent({
+          type: "trace",
+          payload: {
+            operationId: modelOperationId,
+            label: `Contacting ${candidate.replace(/-/g, " ")}`,
+            phase: "model",
+            kind: "model",
+            state: "running",
+          },
+        });
+        const candidateController = new AbortController();
+        const forwardAbort = () => candidateController.abort();
+        opts.signal?.addEventListener("abort", forwardAbort, { once: true });
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            candidateController.abort();
+            reject(modelTimeoutError(candidate));
+          }, MODEL_TURN_TIMEOUT_MS);
+        });
         try {
-          opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "started", purpose: `Preparing web preview: ${title}` } });
-          const artifact = await createSandboxPreview({ title, html });
-          opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "running", purpose: `Web preview: ${title}`, expiresAt: artifact.expiresAt } });
-          opts.onEvent({ type: "artifact", payload: { ...artifact, origin: "create_web_preview", kind: "web-preview" } });
-          const result = { created: true, name: artifact.name, expiresAt: artifact.expiresAt };
-          opts.onEvent({ type: "tool_result", payload: { operationId: call.id, tool: call.name, result, state: "done", sandbox: true } });
-          messages.push({ role: "tool", content: JSON.stringify(result), toolCallId: call.id, name: call.name });
+          streamResult = await Promise.race([
+            streamOne(messages, { ...opts, modelId: candidate, signal: candidateController.signal }),
+            deadline,
+          ]);
+          break;
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          const result = { error: message };
-          opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "error", purpose: `Web preview: ${title}`, error: message } });
+          lastError = error;
+          if (opts.signal?.aborted || !isRetryableProviderError(error)) throw error;
+          const nextCandidate = candidates[candidateIndex + 1];
+          if (nextCandidate) {
+            opts.onEvent({
+              type: "trace",
+              payload: {
+                operationId: modelOperationId,
+                label: `Trying ${nextCandidate.replace(/-/g, " ")} after ${candidate.replace(/-/g, " ")} was unavailable`,
+                phase: "model",
+                kind: "model",
+                state: "running",
+                detail: "The provider did not return a usable planning response in time.",
+              },
+            });
+          }
+        } finally {
+          if (timeout) clearTimeout(timeout);
+          opts.signal?.removeEventListener("abort", forwardAbort);
+        }
+      }
+      if (!streamResult) {
+        opts.onEvent({
+          type: "trace",
+          payload: {
+            operationId: modelOperationId,
+            label: "Switching to Snappy’s reliable model route",
+            phase: "model",
+            kind: "model",
+            state: "running",
+            detail: "The external model route was slow or unavailable; continuing the same workspace run.",
+          },
+        });
+        try {
+          streamResult = await invokeBuiltInFallback(messages, opts);
+        } catch (fallbackError) {
+          const primary = lastError instanceof Error ? lastError.message : "The selected model was unavailable.";
+          const fallback = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+          throw new Error(`${primary} Built-in recovery also failed: ${fallback}`);
+        }
+      }
+
+      const { content, toolCalls } = streamResult;
+      opts.onEvent({ type: "trace", payload: { operationId: modelOperationId, label: toolCalls.length > 0 ? "Prepared the next workspace action" : "Prepared the response", phase: "model", kind: "model", state: "done" } });
+
+      if (content) {
+        messages.push({ role: "assistant", content });
+        finalContent += content;
+      }
+      if (toolCalls.length === 0 || round === maxRounds) {
+        opts.onEvent({ type: "completed", payload: {} });
+        return finalContent;
+      }
+
+      messages.push({
+        role: "assistant",
+        content: content || null,
+        tool_calls: toolCalls.map(call => ({ id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.args) } })),
+      });
+
+      for (const call of toolCalls) {
+        opts.onEvent({ type: "tool_request", payload: { operationId: call.id, tool: call.name, args: call.args, state: "running" } });
+        if (!workspace) {
+          const result = { ok: false, summary: "Sandbox tools are disabled for this run.", error: { code: "sandbox_disabled", message: "Sandbox tools are disabled for this run.", retryable: false } };
           opts.onEvent({ type: "tool_result", payload: { operationId: call.id, tool: call.name, result, error: true, state: "error" } });
-          messages.push({ role: "tool", content: JSON.stringify(result), toolCallId: call.id, name: call.name });
+          messages.push({ role: "tool", content: toolResultForModel(result), toolCallId: call.id, name: call.name });
+          continue;
         }
-        continue;
-      }
 
-      if (call.name !== "run_command") {
-        opts.onEvent({
-          type: "tool_result",
-          payload: { operationId: call.id, tool: call.name, result: "Unknown tool", error: true, state: "error" },
-        });
-        messages.push({
-          role: "tool",
-          content: JSON.stringify({ error: "Unknown tool" }),
-          toolCallId: call.id,
-          name: call.name,
-        });
-        continue;
-      }
-
-      const command = typeof call.args === "string" ? call.args : (call.args as { command?: string })?.command ?? "";
-
-      const policy = splitCommand(command);
-      if (!policy.allowed) {
-        const result = { blocked: true, reason: policy.reason };
-        opts.onEvent({
-          type: "tool_result",
-          payload: { operationId: call.id, tool: call.name, args: { command }, result, error: true, state: "error" },
-        });
-        messages.push({
-          role: "tool",
-          content: JSON.stringify(result),
-          toolCallId: call.id,
-          name: call.name,
-        });
-        continue;
-      }
-
-      try {
-        if (opts.allowSandbox) {
-          opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "started", purpose: "Starting an isolated shell command" } });
+        const execution = await executeAgentTool({ call, workspace, emit: event => opts.onEvent(event) });
+        if (execution.artifact) {
+          opts.onEvent({ type: "artifact", payload: { ...execution.artifact, origin: "create_web_preview", kind: "web-preview" } });
         }
-        const started = Date.now();
-        const result = await runInSandbox(command);
         opts.onEvent({
           type: "tool_result",
           payload: {
             operationId: call.id,
             tool: call.name,
-            args: { command },
-            result: {
-              exitCode: result.exitCode,
-              stdout: result.stdout,
-              stderr: result.stderr,
-              durationMs: Date.now() - started,
-            },
-            sandbox: !!opts.allowSandbox,
-            state: result.exitCode === 0 ? "done" : "error",
+            args: call.args,
+            result: execution.result,
+            error: !execution.result.ok,
+            state: execution.result.ok ? "done" : "error",
+            sandbox: call.name !== "create_web_preview",
           },
         });
-        if (opts.allowSandbox) opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "stopping", purpose: "Sandbox command finished" } });
-        messages.push({
-          role: "tool",
-          content: JSON.stringify(result),
-          toolCallId: call.id,
-          name: call.name,
-        });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        opts.onEvent({
-          type: "tool_result",
-          payload: { operationId: call.id, tool: call.name, args: { command }, result: { error: message }, error: true, state: "error" },
-        });
-        if (opts.allowSandbox) opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "error", purpose: "Sandbox command", error: message } });
-        messages.push({
-          role: "tool",
-          content: JSON.stringify({ error: message }),
-          toolCallId: call.id,
-          name: call.name,
-        });
+        messages.push({ role: "tool", content: toolResultForModel(execution.result), toolCallId: call.id, name: call.name });
       }
     }
-  }
 
-  opts.onEvent({ type: "completed", payload: {} });
-  return finalContent;
+    opts.onEvent({ type: "completed", payload: {} });
+    return finalContent;
+  } finally {
+    await workspace?.dispose();
+  }
 }
 
 export async function listModels() {
-  const res = await fetch("https://opencode.ai/zen/v1/models", {
+  const response = await fetch("https://opencode.ai/zen/v1/models", {
     headers: { Authorization: `Bearer ${process.env.OPENCODE_API_KEY}` },
   });
-  if (!res.ok) throw new Error(`Models endpoint failed with ${res.status}`);
-  const body = (await res.json()) as { data?: { id?: string }[] };
-  return (body.data ?? []).map(m => m.id ?? "").filter(Boolean);
+  if (!response.ok) throw new Error(`Models endpoint failed with ${response.status}`);
+  const body = (await response.json()) as { data?: { id?: string }[] };
+  return (body.data ?? []).map(model => model.id ?? "").filter(Boolean);
 }

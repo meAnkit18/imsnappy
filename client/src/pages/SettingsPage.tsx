@@ -109,7 +109,7 @@ export default function SettingsPage() {
       return;
     }
     localStorage.setItem("imsnappy:opencode_key", opencodeKey.trim());
-    applyPreferences({ provider: "opencode-zen", model: model || "hy3-free" });
+    applyPreferences({ provider: "opencode-zen", model: model || "laguna-s-2.1-free" });
   };
 
   const handleClearApiKey = () => {
@@ -132,7 +132,7 @@ export default function SettingsPage() {
     const numericTokens = Number.parseInt(maxTokens, 10);
     applyPreferences({
       provider: modelProvider as ReturnType<typeof readPreferences>["provider"],
-      model: model || "hy3-free",
+      model: model || "laguna-s-2.1-free",
       temperature: Number.isFinite(numericTemperature) ? numericTemperature : 0.6,
       maxTokens: Number.isFinite(numericTokens) && numericTokens > 0 ? numericTokens : 1024,
     });

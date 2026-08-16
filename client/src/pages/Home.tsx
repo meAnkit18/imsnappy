@@ -388,7 +388,7 @@ export default function Home() {
       headers: { "Content-Type": "application/json" },
       signal: controller.signal,
       body: JSON.stringify({
-        modelId: preferences.model === "deepseek-v4-flash-free" ? "hy3-free" : (preferences.model || "hy3-free"),
+        modelId: preferences.model === "deepseek-v4-flash-free" ? "laguna-s-2.1-free" : (preferences.model || "laguna-s-2.1-free"),
         messages: chatMessages,
         temperature: preferences.temperature ?? 0.6,
         maxTokens: preferences.maxTokens ?? 2048,
