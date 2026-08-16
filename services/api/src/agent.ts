@@ -34,6 +34,7 @@ export type TraceEvent = {
     | "trace"
     | "delta"
     | "tool_request"
+    | "tool_progress"
     | "tool_result"
     | "sandbox_ready"
     | "sandbox"
@@ -246,25 +247,29 @@ export async function runAgent(opts: AgentOptions): Promise<string> {
 
   const lastUserPrompt = [...messages].reverse().find(message => message.role === "user")?.content ?? "";
   if (opts.allowSandbox && isSnakeGameRequest(lastUserPrompt)) {
-    opts.onEvent({ type: "trace", payload: { label: "Creating a playable Snake game in a persistent sandbox", phase: "tool" } });
+    const operationId = `tool-${crypto.randomUUID()}`;
+    const sandboxOperationId = `sandbox-${operationId}`;
+    opts.onEvent({ type: "tool_request", payload: { operationId, tool: "create_web_preview", args: { title: "Snake game" }, state: "running" } });
+    opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "started", purpose: "Creating a playable Snake game" } });
     try {
-      opts.onEvent({ type: "sandbox", payload: { state: "started", purpose: "Creating a playable Snake game" } });
       const artifact = await createSandboxPreview({ title: "Snake game", html: buildSnakeGameHtml() });
-      opts.onEvent({ type: "sandbox", payload: { state: "running", purpose: "Snake game sandbox", expiresAt: artifact.expiresAt } });
+      opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "running", purpose: "Snake game sandbox", expiresAt: artifact.expiresAt } });
       opts.onEvent({ type: "artifact", payload: { ...artifact, origin: "snake", kind: "web-preview" } });
-      opts.onEvent({ type: "tool_result", payload: { tool: "create_web_preview", result: { created: true, name: artifact.name }, sandbox: true } });
+      opts.onEvent({ type: "tool_result", payload: { operationId, tool: "create_web_preview", result: { created: true, name: artifact.name }, state: "done", sandbox: true } });
       const completion = previewCompletionMessage(artifact.name);
       opts.onEvent({ type: "delta", payload: { text: completion } });
       opts.onEvent({ type: "completed", payload: {} });
       return completion;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      opts.onEvent({ type: "tool_result", payload: { tool: "create_web_preview", result: { error: message }, error: true } });
+      opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "error", purpose: "Snake game sandbox", error: message } });
+      opts.onEvent({ type: "tool_result", payload: { operationId, tool: "create_web_preview", result: { error: message }, error: true, state: "error" } });
     }
   }
 
   for (let round = 0; round <= maxRounds; round++) {
-    opts.onEvent({ type: "trace", payload: { label: `Model call (round ${round + 1})`, phase: "model" } });
+    const modelOperationId = `model-round-${round + 1}`;
+    opts.onEvent({ type: "trace", payload: { operationId: modelOperationId, label: round === 0 ? "Understanding the request" : "Reviewing the tool result", phase: "model", kind: "model", state: "running" } });
 
     // Try the requested model first, then fall back across the free fleet on 429.
     const candidates = [opts.modelId, ...FREE_MODELS.map(m => m.id).filter(id => id !== opts.modelId)];
@@ -282,6 +287,7 @@ export async function runAgent(opts: AgentOptions): Promise<string> {
     }
     if (!streamResult) throw lastErr;
     const { content, toolCalls } = streamResult;
+    opts.onEvent({ type: "trace", payload: { operationId: modelOperationId, label: toolCalls.length > 0 ? "Prepared the next action" : "Prepared the response", phase: "model", kind: "model", state: "done" } });
 
     if (content) {
       messages.push({ role: "assistant", content });
@@ -307,24 +313,26 @@ export async function runAgent(opts: AgentOptions): Promise<string> {
     messages.push(assistantMsg);
 
     for (const call of toolCalls) {
-      opts.onEvent({ type: "tool_request", payload: { tool: call.name, args: call.args, pending: true } });
+      const sandboxOperationId = `sandbox-${call.id}`;
+      opts.onEvent({ type: "tool_request", payload: { operationId: call.id, tool: call.name, args: call.args, state: "running" } });
 
       if (call.name === "create_web_preview") {
         const args = typeof call.args === "object" && call.args !== null ? call.args as { title?: unknown; html?: unknown } : {};
         const title = typeof args.title === "string" ? args.title : "Sandbox preview";
         const html = typeof args.html === "string" ? args.html : "";
         try {
-          opts.onEvent({ type: "sandbox_ready", payload: { command: `Preparing web preview: ${title}` } });
+          opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "started", purpose: `Preparing web preview: ${title}` } });
           const artifact = await createSandboxPreview({ title, html });
-          opts.onEvent({ type: "sandbox", payload: { state: "running", purpose: `Web preview: ${title}`, expiresAt: artifact.expiresAt } });
+          opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "running", purpose: `Web preview: ${title}`, expiresAt: artifact.expiresAt } });
           opts.onEvent({ type: "artifact", payload: { ...artifact, origin: "create_web_preview", kind: "web-preview" } });
           const result = { created: true, name: artifact.name, expiresAt: artifact.expiresAt };
-          opts.onEvent({ type: "tool_result", payload: { tool: call.name, result, sandbox: true } });
+          opts.onEvent({ type: "tool_result", payload: { operationId: call.id, tool: call.name, result, state: "done", sandbox: true } });
           messages.push({ role: "tool", content: JSON.stringify(result), toolCallId: call.id, name: call.name });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const result = { error: message };
-          opts.onEvent({ type: "tool_result", payload: { tool: call.name, result, error: true } });
+          opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "error", purpose: `Web preview: ${title}`, error: message } });
+          opts.onEvent({ type: "tool_result", payload: { operationId: call.id, tool: call.name, result, error: true, state: "error" } });
           messages.push({ role: "tool", content: JSON.stringify(result), toolCallId: call.id, name: call.name });
         }
         continue;
@@ -333,7 +341,7 @@ export async function runAgent(opts: AgentOptions): Promise<string> {
       if (call.name !== "run_command") {
         opts.onEvent({
           type: "tool_result",
-          payload: { tool: call.name, result: "Unknown tool", error: true },
+          payload: { operationId: call.id, tool: call.name, result: "Unknown tool", error: true, state: "error" },
         });
         messages.push({
           role: "tool",
@@ -351,7 +359,7 @@ export async function runAgent(opts: AgentOptions): Promise<string> {
         const result = { blocked: true, reason: policy.reason };
         opts.onEvent({
           type: "tool_result",
-          payload: { tool: call.name, args: { command }, result, error: true },
+          payload: { operationId: call.id, tool: call.name, args: { command }, result, error: true, state: "error" },
         });
         messages.push({
           role: "tool",
@@ -364,13 +372,14 @@ export async function runAgent(opts: AgentOptions): Promise<string> {
 
       try {
         if (opts.allowSandbox) {
-          opts.onEvent({ type: "sandbox_ready", payload: { command } });
+          opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "started", purpose: "Starting an isolated shell command" } });
         }
         const started = Date.now();
         const result = await runInSandbox(command);
         opts.onEvent({
           type: "tool_result",
           payload: {
+            operationId: call.id,
             tool: call.name,
             args: { command },
             result: {
@@ -380,8 +389,10 @@ export async function runAgent(opts: AgentOptions): Promise<string> {
               durationMs: Date.now() - started,
             },
             sandbox: !!opts.allowSandbox,
+            state: result.exitCode === 0 ? "done" : "error",
           },
         });
+        if (opts.allowSandbox) opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "stopping", purpose: "Sandbox command finished" } });
         messages.push({
           role: "tool",
           content: JSON.stringify(result),
@@ -392,8 +403,9 @@ export async function runAgent(opts: AgentOptions): Promise<string> {
         const message = err instanceof Error ? err.message : String(err);
         opts.onEvent({
           type: "tool_result",
-          payload: { tool: call.name, args: { command }, result: { error: message }, error: true },
+          payload: { operationId: call.id, tool: call.name, args: { command }, result: { error: message }, error: true, state: "error" },
         });
+        if (opts.allowSandbox) opts.onEvent({ type: "sandbox", payload: { operationId: sandboxOperationId, state: "error", purpose: "Sandbox command", error: message } });
         messages.push({
           role: "tool",
           content: JSON.stringify({ error: message }),

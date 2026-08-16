@@ -74,6 +74,8 @@ import {
   readSandboxLifecycle,
   formatToolRequest,
   formatToolResult,
+  safeActivityText,
+  upsertWorkTrace,
   type SandboxPreviewArtifact,
   type SandboxLifecycleEvent,
   type WorkTraceEntry,
@@ -161,6 +163,7 @@ export default function Home() {
   const [canvasState, setCanvasState] = useState<"off" | "minimized" | "maximized">("off");
   const [recentSessions, setRecentSessions] = useState<StoredSession[]>(() => listSessions());
   const sessionRef = useRef<StoredSession | null>(null);
+  const activityRef = useRef<WorkTraceEntry[]>([]);
   const threadRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const [hasApiKey, setHasApiKey] = useState<boolean>(() => Boolean(localStorage.getItem("imsnappy:opencode_key")));
@@ -226,6 +229,7 @@ export default function Home() {
     setMobileRailOpen(false);
     setCanvasState("off");
     setWorkTrace([]);
+    activityRef.current = [];
     setSandboxLifecycle(null);
   };
 
@@ -246,6 +250,7 @@ export default function Home() {
     const expectsPreview = isSandboxPreviewRequest(cleanPrompt);
     setPreviewPending(expectsPreview);
     setWorkTrace([]);
+    activityRef.current = [];
     setSandboxLifecycle(null);
     sessionRef.current = null;
     setShowResponse(true);
@@ -288,6 +293,15 @@ export default function Home() {
       setIsWorking(false);
       setLiveDraft("");
       setPreviewPending(false);
+      setWorkTrace((current) => {
+        const next = current.map((entry) =>
+          entry.status === "running" && entry.kind !== "sandbox"
+            ? { ...entry, status: "done" as const }
+            : entry,
+        );
+        activityRef.current = next;
+        return next;
+      });
       persistConversation([...previousMessages, userMessage, resolved], cleanPrompt);
       if (currentSession && currentSession.artifactId) {
         const session: StoredSession = {
@@ -301,7 +315,7 @@ export default function Home() {
           prompt: currentSession.prompt ?? cleanPrompt,
           createdAt: new Date().toISOString(),
           expiresAt: currentSession.expiresAt,
-          traceCount: workTrace.length,
+          traceCount: activityRef.current.length,
         };
         saveSession(session);
         setRecentSessions(listSessions());
@@ -309,11 +323,16 @@ export default function Home() {
       }
     };
 
-    const addTraceEntry = (kind: WorkTraceEntry["kind"], label: string, detail?: string, status: WorkTraceEntry["status"] = "done") => {
-      setWorkTrace((current) => [
-        ...current,
-        { id: `tr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, occurredAt: new Date().toISOString(), kind, label, detail, status },
-      ]);
+    const addTraceEntry = (entry: Omit<WorkTraceEntry, "id" | "occurredAt">) => {
+      setWorkTrace((current) => {
+        const next = upsertWorkTrace(current, {
+          ...entry,
+          id: `tr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          occurredAt: new Date().toISOString(),
+        });
+        activityRef.current = next;
+        return next;
+      });
     };
 
     const sandboxLifecycleLabel = (event: SandboxLifecycleEvent): string => {
@@ -401,22 +420,58 @@ export default function Home() {
             } catch {
               continue;
             }
-            if (parsed.type === "run.delta" && typeof parsed.payload?.text === "string") {
+            if (parsed.type === "run.started") {
+              addTraceEntry({ operationId: "run", kind: "run", label: "Snappy started working", status: "running" });
+            } else if (parsed.type === "run.delta" && typeof parsed.payload?.text === "string") {
               updateDelta(parsed.payload.text);
             } else if (parsed.type === "run.trace" && typeof parsed.payload?.label === "string") {
-              addTraceEntry("trace", parsed.payload.label as string);
+              const kind = parsed.payload?.kind;
+              addTraceEntry({
+                operationId: typeof parsed.payload?.operationId === "string" ? parsed.payload.operationId : `trace-${Date.now()}`,
+                kind: kind === "model" || kind === "tool" || kind === "sandbox" || kind === "file" || kind === "browser" || kind === "run" ? kind : parsed.payload?.phase === "model" ? "model" : "trace",
+                label: parsed.payload.label as string,
+                detail: safeActivityText(parsed.payload?.detail),
+                status: parsed.payload?.state === "running" || parsed.payload?.state === "pending" ? parsed.payload.state : parsed.payload?.state === "error" ? "error" : "done",
+              });
             } else if (parsed.type === "run.tool_request") {
               const formatted = formatToolRequest(parsed.payload?.tool, parsed.payload?.args);
-              addTraceEntry("tool", formatted.label, formatted.detail, "running");
+              addTraceEntry({
+                operationId: typeof parsed.payload?.operationId === "string" ? parsed.payload.operationId : `tool-${Date.now()}`,
+                kind: formatted.kind,
+                label: formatted.label,
+                detail: formatted.detail,
+                status: "running",
+              });
+            } else if (parsed.type === "run.tool_progress") {
+              addTraceEntry({
+                operationId: typeof parsed.payload?.operationId === "string" ? parsed.payload.operationId : `tool-progress-${Date.now()}`,
+                kind: "tool",
+                label: typeof parsed.payload?.label === "string" ? parsed.payload.label : "Working with a tool",
+                detail: safeActivityText(parsed.payload?.detail),
+                status: "running",
+              });
             } else if (parsed.type === "run.tool_result") {
               const formatted = formatToolResult(parsed.payload?.tool, parsed.payload?.result, parsed.payload?.error);
-              const sandbox = parsed.payload?.sandbox === true;
-              addTraceEntry(sandbox ? "sandbox" : "tool", formatted.label, formatted.detail, formatted.status);
+              addTraceEntry({
+                operationId: typeof parsed.payload?.operationId === "string" ? parsed.payload.operationId : `tool-result-${Date.now()}`,
+                kind: parsed.payload?.sandbox === true ? "sandbox" : "tool",
+                label: "",
+                status: formatted.status,
+                summary: formatted.summary,
+                output: formatted.output,
+                durationMs: formatted.durationMs,
+              });
             } else if (parsed.type === "run.sandbox") {
               const lifecycle = readSandboxLifecycle(parsed.payload);
               if (lifecycle) {
                 setSandboxLifecycle(lifecycle);
-                addTraceEntry("sandbox", sandboxLifecycleLabel(lifecycle), lifecycle.error, lifecycle.state === "error" ? "error" : lifecycle.state === "running" ? "done" : "running");
+                addTraceEntry({
+                  operationId: lifecycle.operationId ?? `sandbox-${Date.now()}`,
+                  kind: "sandbox",
+                  label: sandboxLifecycleLabel(lifecycle),
+                  detail: lifecycle.purpose ?? lifecycle.error,
+                  status: lifecycle.state === "error" ? "error" : lifecycle.state === "started" || lifecycle.state === "running" ? "running" : "done",
+                });
                 if (lifecycle.state === "started") setCanvasState((current) => (current === "off" ? "minimized" : current));
               }
             } else if (parsed.type === "run.artifact") {
@@ -426,6 +481,7 @@ export default function Home() {
                 setSandboxPreview(artifact);
                 setPreviewPending(false);
                 lastArtifact = artifact;
+                addTraceEntry({ operationId: `artifact-${artifact.artifactId}`, kind: "browser", label: "Interactive preview is ready", detail: artifact.name.replace(/\.html$/i, ""), status: "done" });
                 setCanvasState((current) => (current === "off" || current === "minimized" ? "maximized" : current));
                 setConversationPanelOpen(true);
                 if (currentSession) {
@@ -613,6 +669,7 @@ export default function Home() {
                       working={isWorking}
                       onTryAgain={() => submitPrompt(submittedPrompt)}
                       messages={messages}
+                      workTrace={workTrace}
                     />
                   )}
                 </>
@@ -702,12 +759,16 @@ function ConversationView({
   working,
   onTryAgain,
   messages = [],
+  workTrace,
 }: {
   submittedPrompt: string;
   working: boolean;
   onTryAgain: () => void;
   messages?: AgentMessage[];
+  workTrace: WorkTraceEntry[];
 }) {
+  const activeMessage = messages.find((entry) => entry.isWorking);
+  const lastCompletedAgentId = [...messages].reverse().find((entry) => entry.role === "agent" && !entry.isWorking)?.id;
   return (
     <div className="animate-editorial-in mx-auto w-full max-w-[700px] pb-10 pt-4">
       {messages.length === 0 && submittedPrompt && (
@@ -737,6 +798,7 @@ function ConversationView({
                   <p className="mt-3 max-w-[640px] whitespace-pre-wrap text-[15px] leading-7 text-[#4e4e4e]">
                     {message.text || ""}
                   </p>
+                  {message.id === lastCompletedAgentId && workTrace.length > 0 && <InlineActivityTimeline entries={workTrace} working={false} />}
                 </div>
               </div>
             )}
@@ -747,12 +809,10 @@ function ConversationView({
             <PulseMark size="small" />
             <div className="min-w-0 flex-1 pt-0.5">
               <p className="agent-response-label">I’m Snappy</p>
+              <InlineActivityTimeline entries={workTrace} working />
               <p className="mt-3 max-w-[640px] whitespace-pre-wrap text-[15px] leading-7 text-[#4e4e4e]">
-                {messages.find((entry) => entry.isWorking)?.text ?? ""}
+                {activeMessage?.text ?? ""}
               </p>
-              <span className="mt-3 inline-flex items-center gap-1.5 text-[11px] text-[#8a857d]">
-                <span className="agent-pulse-small"><i /><i /><i /></span> Writing the response
-              </span>
             </div>
           </div>
         )}
@@ -1006,6 +1066,8 @@ function CanvasConversationPanel({
   onClose: () => void;
 }) {
   const working = messages.some((entry) => entry.isWorking);
+  const activeMessage = messages.find((entry) => entry.isWorking);
+  const lastCompletedAgentId = [...messages].reverse().find((entry) => entry.role === "agent" && !entry.isWorking)?.id;
   return (
     <aside className="canvas-conversation-panel relative flex shrink-0 flex-col overflow-hidden border-l border-[#e7e5e4] bg-[#fafafa]/80" aria-label="Canvas conversation and agent actions">
       <div className="relative flex h-full min-h-0 flex-col">
@@ -1047,21 +1109,19 @@ function CanvasConversationPanel({
                       <p className="mt-2 whitespace-pre-wrap text-[13px] leading-6 text-[#292524]">
                         {message.text || "The sandbox result is preparing."}
                       </p>
-                      <button type="button" onClick={onToggleTrace} className="canvas-work-trace mt-4">
-                        <span className="trace-live-dot" />
-                        <span>Work trace</span>
-                        <span className="ml-auto text-[#777169]">{workTrace.length > 0 ? `${workTrace.length} step${workTrace.length === 1 ? "" : "s"}` : "0 steps"}</span>
-                        <ChevronDown size={13} className={`transition-transform duration-200 ${traceExpanded ? "rotate-180" : ""}`} />
-                      </button>
-                      {traceExpanded && <LiveWorkTrace entries={workTrace} lifecycle={lifecycle} />}
+                      {message.id === lastCompletedAgentId && workTrace.length > 0 && <InlineActivityTimeline entries={workTrace} working={false} compact />}
                     </div>
                   )}
                 </div>
               ))}
               {working && (
-                <div className="flex items-center gap-2 pt-1">
-                  <span className="agent-pulse-small"><i /><i /><i /></span>
-                  <span className="text-[12px] text-[#777169]">I’m Snappy is thinking…</span>
+                <div className="canvas-thread-agent pt-1">
+                  <div className="flex items-center gap-2">
+                    <span className="agent-pulse-small"><i /><i /><i /></span>
+                    <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-[#777169]">I’m Snappy</span>
+                  </div>
+                  <InlineActivityTimeline entries={workTrace} working compact />
+                  {activeMessage?.text && <p className="mt-3 whitespace-pre-wrap text-[13px] leading-6 text-[#292524]">{activeMessage.text}</p>}
                 </div>
               )}
             </div>
@@ -1128,6 +1188,86 @@ function LiveWorkTrace({ entries, lifecycle }: { entries: WorkTraceEntry[]; life
         </div>
       ))}
     </div>
+  );
+}
+
+function InlineActivityTimeline({
+  entries,
+  working,
+  compact = false,
+}: {
+  entries: WorkTraceEntry[];
+  working: boolean;
+  compact?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const [openOperationId, setOpenOperationId] = useState<string | null>(null);
+  const completedCount = entries.filter((entry) => entry.status === "done").length;
+  const activeEntry = [...entries].reverse().find((entry) => entry.status === "running" || entry.status === "pending");
+  const visibleEntries = compact && !expanded ? entries.slice(-1) : entries;
+  const heading = working
+    ? activeEntry?.label ?? "Working through the request"
+    : `${completedCount || entries.length} activity step${(completedCount || entries.length) === 1 ? "" : "s"} completed`;
+
+  return (
+    <section className={`mt-3 overflow-hidden rounded-xl border border-[#e7e5e4] bg-[#fbfbfa]/90 ${compact ? "" : "max-w-[640px]"}`} aria-label="Live agent activity" aria-live="polite">
+      <button
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+        className="flex w-full items-center gap-2 px-3.5 py-3 text-left transition-colors hover:bg-[#f5f4f2]"
+        aria-expanded={expanded}
+      >
+        <span className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${working ? "bg-[#eaf5ef] text-[#43806f]" : "bg-[#f0efed] text-[#6b665f]"}`}>
+          {working ? <span className="agent-pulse-small scale-[0.68]" aria-hidden="true"><i /><i /><i /></span> : "✓"}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[12px] font-medium text-[#3d3934]">{heading}</span>
+          {working && activeEntry?.detail && <span className="mt-0.5 block truncate font-mono text-[10px] text-[#918b82]">{activeEntry.detail}</span>}
+        </span>
+        <span className="shrink-0 text-[10px] uppercase tracking-[0.1em] text-[#a19b93]">{working ? "Live" : "Trace"}</span>
+        <ChevronDown size={14} className={`shrink-0 text-[#8a857d] transition-transform duration-200 ${expanded ? "rotate-180" : ""}`} />
+      </button>
+      {expanded && (
+        <div className="border-t border-[#eeece9] px-3.5 py-2.5">
+          {visibleEntries.length === 0 ? (
+            <div className="flex items-center gap-2 py-1 text-[11px] text-[#8a857d]"><span className="agent-pulse-small"><i /><i /><i /></span> Establishing the first step…</div>
+          ) : (
+            <ol className="space-y-0.5">
+              {visibleEntries.map((entry) => {
+                const hasDetails = Boolean(entry.detail || entry.summary || entry.output || entry.durationMs);
+                const isOpen = openOperationId === entry.operationId;
+                return (
+                  <li key={entry.id} className="rounded-lg">
+                    <button
+                      type="button"
+                      onClick={() => hasDetails && setOpenOperationId((current) => current === entry.operationId ? null : entry.operationId)}
+                      disabled={!hasDetails}
+                      className={`flex w-full items-start gap-2.5 px-1.5 py-2 text-left ${hasDetails ? "cursor-pointer hover:bg-[#f4f3f1]" : "cursor-default"}`}
+                    >
+                      <span className={`mt-1 inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center text-[10px] ${entry.status === "error" ? "text-[#a65d57]" : entry.status === "done" ? "text-[#5c9d8a]" : "text-[#8a857d]"}`}>
+                        {entry.status === "error" ? "×" : entry.status === "done" ? "✓" : <span className="agent-pulse-small scale-[0.55]"><i /><i /><i /></span>}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className={`block text-[11px] leading-5 ${entry.status === "error" ? "text-[#a65d57]" : "text-[#4e4a45]"}`}>{entry.label}</span>
+                        {entry.detail && <span className="block truncate font-mono text-[10px] leading-4 text-[#9b958c]">{entry.detail}</span>}
+                      </span>
+                      {hasDetails && <ChevronDown size={12} className={`mt-1 shrink-0 text-[#a8a29e] transition-transform ${isOpen ? "rotate-180" : ""}`} />}
+                    </button>
+                    {isOpen && (
+                      <div className="mb-1 ml-7 rounded-md border border-[#ece9e5] bg-white px-2.5 py-2 text-[10px] leading-4 text-[#777169]">
+                        {entry.summary && <p>{entry.summary}</p>}
+                        {entry.durationMs !== undefined && <p className="mt-1">Duration: {(entry.durationMs / 1000).toFixed(entry.durationMs < 10_000 ? 1 : 0)}s</p>}
+                        {entry.output && <pre className="mt-1.5 max-h-24 overflow-auto whitespace-pre-wrap font-mono text-[9px] leading-4 text-[#69645d]">{entry.output}</pre>}
+                      </div>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 

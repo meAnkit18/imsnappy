@@ -59,11 +59,12 @@ export function registerChatStream(app: Express) {
         maxTokens: input.maxTokens ?? 2048,
         allowSandbox: input.allowSandbox ?? true,
         onEvent: event => {
-          if (event.type === "delta") send("run.delta", { text: event.payload.text });
-          else if (event.type === "trace") send("run.trace", { label: event.payload.label, phase: event.payload.phase });
-          else if (event.type === "tool_request") send("run.tool_request", { tool: event.payload.tool, args: event.payload.args });
-          else if (event.type === "tool_result") send("run.tool_result", { tool: event.payload.tool, result: event.payload.result, error: event.payload.error });
-          else if (event.type === "sandbox_ready") send("run.trace", { label: `Sandbox started for: ${event.payload.command}`, phase: "tool" });
+          if (event.type === "delta") send("run.delta", event.payload);
+          else if (event.type === "trace") send("run.trace", event.payload);
+          else if (event.type === "tool_request") send("run.tool_request", event.payload);
+          else if (event.type === "tool_progress") send("run.tool_progress", event.payload);
+          else if (event.type === "tool_result") send("run.tool_result", event.payload);
+          else if (event.type === "sandbox_ready") send("run.trace", { operationId: `sandbox-${Date.now()}`, label: `Sandbox started for: ${event.payload.command}`, phase: "tool", kind: "sandbox", state: "running" });
           else if (event.type === "sandbox") send("run.sandbox", event.payload);
           else if (event.type === "artifact") send("run.artifact", event.payload);
           else if (event.type === "completed") {

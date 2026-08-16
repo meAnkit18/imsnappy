@@ -7,7 +7,9 @@ import {
   isSandboxPreviewRequest,
   readSandboxLifecycle,
   readSandboxPreviewArtifact,
+  safeActivityText,
   sandboxPreviewCompletionMessage,
+  upsertWorkTrace,
 } from "../client/src/lib/sandboxPreview";
 import { previewCompletionMessage } from "./agent";
 import { buildSnakeGameHtml, isSnakeGameRequest, previewNameFromTitle, validatePreviewHtml } from "./preview";
@@ -78,20 +80,31 @@ describe("browser artifact event parsing", () => {
   });
 
   it("surfaces tool requests with deterministic, user-friendly trace labels", () => {
-    expect(formatToolRequest("run_command", { command: "ls -la" })).toMatchObject({ label: "Run shell command in sandbox", detail: "ls -la" });
-    expect(formatToolRequest("create_web_preview", { title: "My quiz app" })).toMatchObject({ label: "Build interactive browser preview", detail: "My quiz app" });
-    expect(formatToolRequest("unknown_tool", { something: 1 })).toEqual({ label: "Use tool: unknown_tool" });
+    expect(formatToolRequest("run_command", { command: "ls -la" })).toMatchObject({ kind: "sandbox", label: "Inspecting the sandbox workspace", detail: "ls -la" });
+    expect(formatToolRequest("run_command", { command: "cat notes.md" })).toMatchObject({ kind: "file", label: "Reading a file in the sandbox" });
+    expect(formatToolRequest("create_web_preview", { title: "My quiz app" })).toMatchObject({ kind: "browser", label: "Building an interactive browser preview", detail: "My quiz app" });
+    expect(formatToolRequest("unknown_tool", { something: 1 })).toEqual({ kind: "tool", label: "Using unknown tool" });
   });
 
-  it("derives trace entry status and labels from tool results", () => {
+  it("derives trace entry status and safe expandable details from tool results", () => {
     expect(formatToolResult("run_command", { exitCode: 0, stdout: "ok" }, null).status).toBe("done");
     expect(formatToolResult("run_command", { exitCode: 1, stderr: "boom" }, null).status).toBe("error");
-    expect(formatToolResult("run_command", { blocked: true, reason: "rm -rf / is not allowed" }, null)).toMatchObject({ label: "Command blocked by policy", status: "error" });
+    expect(formatToolResult("run_command", { blocked: true, reason: "rm -rf / is not allowed" }, null)).toMatchObject({ summary: "rm -rf / is not allowed", status: "error" });
     expect(formatToolResult("run_command", null, true).status).toBe("error");
   });
 
+  it("redacts secrets and only updates an existing operation in place", () => {
+    expect(safeActivityText("export API_KEY=sk_abc123")).toContain("[redacted]");
+    const [updated] = upsertWorkTrace([
+      { id: "trace-1", operationId: "tool-1", occurredAt: "2026-08-16T00:00:00Z", kind: "file", label: "Reading a file in the sandbox", detail: "cat plan.md", status: "running" },
+    ], {
+      id: "trace-2", operationId: "tool-1", occurredAt: "2026-08-16T00:00:01Z", kind: "tool", label: "", status: "done", summary: "Completed in the sandbox.", output: "ok",
+    });
+    expect(updated).toMatchObject({ id: "trace-1", label: "Reading a file in the sandbox", status: "done", summary: "Completed in the sandbox." });
+  });
+
   it("parses sandbox lifecycle events with strict state validation", () => {
-    expect(readSandboxLifecycle({ state: "started", purpose: "Snake game sandbox" })).toMatchObject({ state: "started", purpose: "Snake game sandbox" });
+    expect(readSandboxLifecycle({ operationId: "sandbox-tool-1", state: "started", purpose: "Snake game sandbox" })).toMatchObject({ operationId: "sandbox-tool-1", state: "started", purpose: "Snake game sandbox" });
     expect(readSandboxLifecycle({ state: "running", expiresAt: "2099-01-01T00:00:00Z" })).toMatchObject({ state: "running" });
     expect(readSandboxLifecycle({ state: "expired" })).toMatchObject({ state: "expired" });
     expect(readSandboxLifecycle({ state: "error", error: "provisioning failed" })).toMatchObject({ state: "error" });
@@ -103,5 +116,7 @@ describe("browser artifact event parsing", () => {
     const homeSource = readFileSync(resolve(process.cwd(), "client/src/pages/Home.tsx"), "utf8");
     expect(homeSource).toContain('{message.text || "The sandbox result is preparing."}');
     expect(homeSource).not.toContain("I’d start by separating the useful signal from the surrounding noise");
+    expect(homeSource).toContain("InlineActivityTimeline");
+    expect(homeSource).toContain("upsertWorkTrace");
   });
 });
