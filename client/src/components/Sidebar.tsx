@@ -60,6 +60,7 @@ export default function Sidebar({
   const [expanded, setExpanded] = useState(false);
   const [, navigate] = useLocation();
   const [, setLocation] = useLocation();
+  const canExpandRail = () => window.matchMedia("(min-width: 768px)").matches;
 
   const goHome = () => {
     setLocation("/");
@@ -75,13 +76,13 @@ export default function Sidebar({
   return (
     <>
       <aside
-        onMouseEnter={() => setExpanded(true)}
-        onMouseLeave={() => setExpanded(false)}
-        onFocusCapture={() => setExpanded(true)}
+        onMouseEnter={() => canExpandRail() && setExpanded(true)}
+        onMouseLeave={() => canExpandRail() && setExpanded(false)}
+        onFocusCapture={() => canExpandRail() && setExpanded(true)}
         onBlurCapture={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget as Node)) setExpanded(false);
+          if (canExpandRail() && !event.currentTarget.contains(event.relatedTarget as Node)) setExpanded(false);
         }}
-        className={`archive-rail fixed inset-y-0 left-0 z-50 flex w-[280px] flex-col overflow-hidden border-r border-[#e7e5e4] bg-[#fafafa]/95 backdrop-blur-xl md:static md:w-[76px] ${expanded ? "is-expanded" : ""}`}
+        className={`archive-rail fixed inset-y-0 left-0 z-50 flex w-[76px] flex-col overflow-hidden border-r border-[#e7e5e4] bg-[#fafafa]/95 backdrop-blur-xl md:static ${expanded ? "is-expanded" : ""}`}
       >
         {/* Compact view */}
         <div className={`rail-compact-view rail-view ${expanded ? "rail-view-hidden" : ""}`} aria-label="Compact workspace navigation">

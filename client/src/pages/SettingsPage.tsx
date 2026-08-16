@@ -4,101 +4,143 @@
  * Editorial off-white canvas, warm ink type.
  */
 import { useEffect, useState } from "react";
-import { KeyRound, Bot, User, Bell, Palette, Globe2, Save } from "lucide-react";
+import { KeyRound, Bot, User, Palette, Globe2, Save } from "lucide-react";
 import { toast } from "sonner";
 import DiscoverLayout from "@/components/DiscoverLayout";
-import { useApiSession } from "@/contexts/ApiSessionContext";
+import { FREE_MODELS } from "@/lib/agent";
+import { readPreferences, savePreferences } from "@/lib/localStore";
+import { trpc } from "@/lib/trpc";
+
+type ProviderKey = {
+  id: string;
+  name: string;
+  placeholder: string;
+  description: string;
+};
+
+const PROVIDER_KEYS: ProviderKey[] = [
+  { id: "opencode-zen", name: "OpenCode Zen", placeholder: "sk-…", description: "Free research models — works in this preview immediately." },
+  { id: "openai", name: "OpenAI", placeholder: "sk-…", description: "GPT models. Stored on this device until the backend forwards it." },
+  { id: "anthropic", name: "Anthropic", placeholder: "sk-ant-…", description: "Claude models for long-form drafting." },
+  { id: "google", name: "Google AI", placeholder: "AIza…", description: "Gemini models for multimodal work." },
+  { id: "openrouter", name: "OpenRouter", placeholder: "sk-or-…", description: "Route across many providers through one key." },
+  { id: "ollama", name: "Ollama (local)", placeholder: "http://localhost:11434", description: "Base URL of a local Ollama instance, no key needed." },
+];
+
+const readProviderKey = (id: string) => localStorage.getItem(`imsnappy:key:${id}`) ?? "";
+const writeProviderKey = (id: string, value: string) => {
+  if (value.trim()) localStorage.setItem(`imsnappy:key:${id}`, value.trim());
+  else localStorage.removeItem(`imsnappy:key:${id}`);
+};
+
+const LOCAL_PERSISTED = readPreferences();
 
 export default function SettingsPage() {
-  const { api, session, saveSession, clearSession } = useApiSession();
-  const [modelProvider, setModelProvider] = useState("opencode");
-  const [modelId, setModelId] = useState("deepseek-v4-flash-free");
-  const [temperature, setTemperature] = useState("0.7");
-  const [maxTokens, setMaxTokens] = useState("4096");
-  const [apiKeys, setApiKeys] = useState<Record<string, string>>({
-    opencode: "",
+  const { data: me } = trpc.auth.me.useQuery(undefined, { retry: 0 });
+  const isSignedIn = Boolean(me?.openId);
+  const utils = trpc.useUtils();
+  const { data: serverPrefs } = trpc.settings.get.useQuery(undefined, { enabled: isSignedIn, retry: 0 });
+  const updateSettings = trpc.settings.update.useMutation({
+    onSuccess: () => {
+      utils.settings.get.invalidate();
+      toast.message("Preferences saved.", { description: "Stored on the server and this device — the agent reads them everywhere." });
+    },
+    onError: (error) => {
+      toast.error("Could not save to the server.", { description: `${error.message} — still stored on this device for the local preview.` });
+    },
   });
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [accountName, setAccountName] = useState("");
-  const [hasSavedKey, setHasSavedKey] = useState(false);
-  const [userName, setUserName] = useState("Avery Morgan");
-  const [workspaceName, setWorkspaceName] = useState("Personal workspace");
-  const [aboutText, setAboutText] = useState(
-    "I work on editorial and research projects. I prefer concise, well-structured outputs with a warm but professional tone. I value clarity over verbosity.",
+
+  const PERSISTED = serverPrefs && isSignedIn ? { ...LOCAL_PERSISTED, ...serverPrefs } : LOCAL_PERSISTED;
+
+  const [modelProvider, setModelProvider] = useState<string>(PERSISTED.provider);
+  const [model, setModel] = useState(PERSISTED.model);
+  const [temperature, setTemperature] = useState(String(PERSISTED.temperature));
+  const [maxTokens, setMaxTokens] = useState(String(PERSISTED.maxTokens));
+
+  useEffect(() => {
+    if (serverPrefs && isSignedIn) {
+      setModelProvider(serverPrefs.provider);
+      setModel(serverPrefs.model);
+      setTemperature(String(serverPrefs.temperature));
+      setMaxTokens(String(serverPrefs.maxTokens));
+      setUserName(serverPrefs.userName || "Avery Morgan");
+      setAboutText(serverPrefs.aboutText);
+      setWorkspaceName(serverPrefs.workspaceName || "");
+      setAgentPersonality(serverPrefs.agentPersonality || "");
+    }
+  }, [serverPrefs, isSignedIn]);
+
+  const [opencodeKey, setOpencodeKey] = useState(() => localStorage.getItem("imsnappy:opencode_key") ?? "");
+  const [providerKeys, setProviderKeys] = useState<Record<string, string>>(
+    () => Object.fromEntries(PROVIDER_KEYS.filter((p) => p.id !== "opencode-zen").map((p) => [p.id, readProviderKey(p.id)])),
   );
+  const [userName, setUserName] = useState(PERSISTED.userName || "Avery Morgan");
+  const [aboutText, setAboutText] = useState(PERSISTED.aboutText);
+  const [workspaceName, setWorkspaceName] = useState(PERSISTED.workspaceName || "");
+  const [agentPersonality, setAgentPersonality] = useState(PERSISTED.agentPersonality || "");
   const [notificationsEnabled, setNotificationsEnabled] = useState(true);
   const [soundEnabled, setSoundEnabled] = useState(false);
   const [autoSave, setAutoSave] = useState(true);
   const [darkMode, setDarkMode] = useState(false);
   const [compactLayout, setCompactLayout] = useState(false);
 
-  useEffect(() => {
-    if (!session || !api.configured) return;
-    void api.getProviderSettings().then(({ providers }) => {
-      const current = providers.find((provider) => provider.provider === "opencode");
-      if (current) {
-        setModelId(current.modelId);
-        setHasSavedKey(current.hasApiKey);
-      }
-    }).catch(() => undefined);
-  }, [api, session]);
-
-  const handleAccount = async (mode: "login" | "register") => {
-    if (!api.configured) {
-      toast.error("Add VITE_API_BASE_URL before connecting an account.");
+  const applyPreferences = (patch: Partial<ReturnType<typeof readPreferences>>) => {
+    savePreferences(patch);
+    if (!isSignedIn) {
+      toast.message("Preferences saved.", { description: "Stored on this device. The agent will use them in the local preview." });
       return;
     }
-    try {
-      const nextSession = mode === "register"
-        ? await api.register({ name: accountName || email.split("@")[0] || "Snappy user", email, password })
-        : await api.login({ email, password });
-      saveSession(nextSession);
-      setPassword("");
-      toast.success(mode === "register" ? "Account created and connected." : "Signed in to your workspace.");
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Account connection failed.");
-    }
+    updateSettings.mutate({
+      provider: patch.provider ?? modelProvider,
+      model: patch.model ?? model,
+      temperature: patch.temperature ?? PERSISTED.temperature,
+      maxTokens: patch.maxTokens ?? PERSISTED.maxTokens,
+      aboutText: patch.aboutText ?? aboutText,
+      workspaceName: patch.workspaceName ?? workspaceName,
+      agentPersonality: patch.agentPersonality ?? agentPersonality,
+      userName: patch.userName ?? userName,
+      streaming: patch.streaming ?? PERSISTED.streaming,
+    });
   };
 
-  const handleSaveApiKey = async () => {
-    if (!session) {
-      toast.error("Sign in before saving a model configuration.");
+  const handleSaveApiKey = () => {
+    if (opencodeKey.trim().length < 12) {
+      toast.error("That key looks too short.", { description: "Paste the full OpenCode Zen key so the agent can reach the model." });
       return;
     }
-    try {
-      const { provider } = await api.saveOpenCodeSettings({ modelId, apiKey: apiKeys.opencode || undefined });
-      setApiKeys({ opencode: "" });
-      setHasSavedKey(provider.hasApiKey);
-      toast.success("OpenCode configuration saved securely.", { description: "The key is encrypted by the API and is never written to this browser’s persistent storage." });
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not save the OpenCode configuration.");
-    }
+    localStorage.setItem("imsnappy:opencode_key", opencodeKey.trim());
+    applyPreferences({ provider: "opencode-zen", model: model || "hy3-free" });
+  };
+
+  const handleClearApiKey = () => {
+    localStorage.removeItem("imsnappy:opencode_key");
+    setOpencodeKey("");
+    toast.message("Provider key cleared.", { description: "The agent will fall back to the local preview loop." });
   };
 
   const handleSaveProfile = () => {
-    toast.message("Profile saved.", { description: "Your preferences and about text are updated." });
+    applyPreferences({
+      userName: userName.trim(),
+      aboutText: aboutText.trim(),
+      workspaceName: workspaceName.trim(),
+      agentPersonality: agentPersonality.trim(),
+    });
+  };
+
+  const handleSaveModel = () => {
+    const numericTemperature = Number.parseFloat(temperature);
+    const numericTokens = Number.parseInt(maxTokens, 10);
+    applyPreferences({
+      provider: modelProvider as ReturnType<typeof readPreferences>["provider"],
+      model: model || "hy3-free",
+      temperature: Number.isFinite(numericTemperature) ? numericTemperature : 0.6,
+      maxTokens: Number.isFinite(numericTokens) && numericTokens > 0 ? numericTokens : 1024,
+    });
   };
 
   return (
     <DiscoverLayout page="settings">
       <div className="max-w-2xl">
-        <section className="settings-section">
-          <span className="settings-section-label flex items-center gap-2"><User size={12} /> Account connection</span>
-          {session ? (
-            <div className="settings-field">
-              <span className="settings-field-hint">This browser is connected with a short-lived workspace session.</span>
-              <button type="button" className="api-key-save mt-3" onClick={() => { clearSession(); toast.message("Signed out of this browser."); }}>Sign out</button>
-            </div>
-          ) : (
-            <div className="grid gap-3 sm:grid-cols-2">
-              <input className="settings-input" placeholder="Name (for a new account)" value={accountName} onChange={(event) => setAccountName(event.target.value)} />
-              <input className="settings-input" type="email" placeholder="Email" value={email} onChange={(event) => setEmail(event.target.value)} />
-              <input className="settings-input sm:col-span-2" type="password" minLength={12} placeholder="Password (12+ characters)" value={password} onChange={(event) => setPassword(event.target.value)} />
-              <div className="flex gap-2 sm:col-span-2"><button type="button" className="api-key-save" onClick={() => void handleAccount("login")}>Sign in</button><button type="button" className="api-key-save" onClick={() => void handleAccount("register")}>Create account</button></div>
-            </div>
-          )}
-        </section>
         {/* Model */}
         <section className="settings-section">
           <span className="settings-section-label flex items-center gap-2">
@@ -115,17 +157,42 @@ export default function SettingsPage() {
               value={modelProvider}
               onChange={(e) => setModelProvider(e.target.value)}
             >
-              <option value="opencode">OpenCode Zen</option>
+              <option value="opencode-zen">OpenCode Zen (free models)</option>
+              <option value="openai">OpenAI (GPT-4o)</option>
+              <option value="anthropic">Anthropic (Claude)</option>
+              <option value="google">Google (Gemini)</option>
+              <option value="openrouter">OpenRouter (multi-model)</option>
+              <option value="local">Local (Ollama)</option>
             </select>
             <span className="settings-field-hint">
-              The platform initially routes runs through OpenCode Zen. Additional providers can be added behind the same encrypted server-side configuration boundary.
+              OpenCode Zen’s free models work in this preview immediately. Add your key below for other providers.
             </span>
           </div>
 
           <div className="settings-field">
-            <label className="settings-field-label" htmlFor="model-id">Model</label>
-            <input id="model-id" className="settings-input" value={modelId} onChange={(event) => setModelId(event.target.value)} />
-            <span className="settings-field-hint">Example: <code>deepseek-v4-flash-free</code>. The server validates and uses this model for new agent runs.</span>
+            <label className="settings-field-label" htmlFor="model-id">
+              Model
+            </label>
+            <select
+              id="model-id"
+              className="settings-select"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+            >
+              {FREE_MODELS.map((entry) => (
+                <option key={entry.id} value={entry.id}>
+                  {entry.label}
+                </option>
+              ))}
+            </select>
+            <span className="settings-field-hint">Model used for the local preview agent responses.</span>
+          </div>
+
+          <div className="settings-field">
+            <button type="button" className="api-key-save flex items-center gap-2" onClick={handleSaveModel}>
+              <Save size={13} />
+              Save model settings
+            </button>
           </div>
 
           <div className="settings-field">
@@ -160,33 +227,88 @@ export default function SettingsPage() {
           </div>
         </section>
 
-        {/* API Keys */}
+        {/* Live preview hint */}
+        <section className="settings-section">
+          <span className="settings-section-label flex items-center gap-2">
+            <KeyRound size={12} /> Preview model access
+          </span>
+          <div className="settings-field">
+            <label className="settings-field-label" htmlFor="opencode-key">
+              OpenCode Zen key (local preview)
+            </label>
+            <div className="api-key-row">
+              <input
+                id="opencode-key"
+                type="password"
+                placeholder="sk-…"
+                className="settings-input"
+                value={opencodeKey}
+                onChange={(e) => setOpencodeKey(e.target.value)}
+              />
+              <button type="button" className="api-key-save" onClick={handleSaveApiKey}>
+                Save
+              </button>
+              {localStorage.getItem("imsnappy:opencode_key") && (
+                <button type="button" className="api-key-clear" onClick={handleClearApiKey}>
+                  Clear
+                </button>
+              )}
+            </div>
+            <span className="settings-field-hint">
+              Stored only on this device so you can test the real model here. Rotate it after testing.
+            </span>
+          </div>
+        </section>
+
+        {/* API Keys — per-provider management */}
         <section className="settings-section">
           <span className="settings-section-label flex items-center gap-2">
             <KeyRound size={12} /> API Keys
           </span>
 
-          {Object.entries(apiKeys).map(([provider, value]) => (
-            <div key={provider} className="settings-field">
-              <label className="settings-field-label" htmlFor={`api-${provider}`}>
-                {provider.charAt(0).toUpperCase() + provider.slice(1)}
+          {PROVIDER_KEYS.filter((p) => p.id !== "opencode-zen").map((provider) => (
+            <div key={provider.id} className="settings-field">
+              <label className="settings-field-label" htmlFor={`provider-key-${provider.id}`}>
+                {provider.name}
               </label>
               <div className="api-key-row">
                 <input
-                  id={`api-${provider}`}
+                  id={`provider-key-${provider.id}`}
                   type="password"
-                  placeholder={`sk-…`}
+                  placeholder={provider.placeholder}
                   className="settings-input"
-                  value={value}
-                  onChange={(e) => setApiKeys((prev) => ({ ...prev, [provider]: e.target.value }))}
+                  value={providerKeys[provider.id] ?? ""}
+                  onChange={(e) => setProviderKeys((current) => ({ ...current, [provider.id]: e.target.value }))}
                 />
-                <button type="button" className="api-key-save" onClick={() => void handleSaveApiKey()}>
-                  Save
+                <button
+                  type="button"
+                  className="api-key-save"
+                  onClick={() => {
+                    const value = providerKeys[provider.id] ?? "";
+                    writeProviderKey(provider.id, value);
+                    setProviderKeys((current) => ({ ...current, [provider.id]: readProviderKey(provider.id) }));
+                    toast.message(`${provider.name} key ${value.trim() ? "saved" : "cleared"}.`, {
+                      description: provider.description,
+                    });
+                  }}
+                >
+                  {readProviderKey(provider.id) ? "Update" : "Save"}
                 </button>
+                {readProviderKey(provider.id) && (
+                  <button
+                    type="button"
+                    className="api-key-clear"
+                    onClick={() => {
+                      writeProviderKey(provider.id, "");
+                      setProviderKeys((current) => ({ ...current, [provider.id]: "" }));
+                      toast.message(`${provider.name} key removed.`);
+                    }}
+                  >
+                    Clear
+                  </button>
+                )}
               </div>
-              <span className="settings-field-hint">
-                {hasSavedKey ? "A key is already encrypted in your workspace. Enter a replacement only to rotate it." : "Keys are sent directly to the API over HTTPS and encrypted before storage."}
-              </span>
+              <span className="settings-field-hint">{provider.description}</span>
             </div>
           ))}
         </section>
@@ -211,19 +333,6 @@ export default function SettingsPage() {
           </div>
 
           <div className="settings-field">
-            <label className="settings-field-label" htmlFor="workspace-name">
-              Workspace
-            </label>
-            <input
-              id="workspace-name"
-              type="text"
-              className="settings-input"
-              value={workspaceName}
-              onChange={(e) => setWorkspaceName(e.target.value)}
-            />
-          </div>
-
-          <div className="settings-field">
             <label className="settings-field-label" htmlFor="about-text">
               About yourself
             </label>
@@ -239,10 +348,42 @@ export default function SettingsPage() {
             </span>
           </div>
 
-          <button type="button" className="api-key-save flex items-center gap-2 mt-2" onClick={handleSaveProfile}>
-            <Save size={13} />
-            Save profile
-          </button>
+          <div className="settings-field">
+            <label className="settings-field-label" htmlFor="workspace-name">
+              Workspace name
+            </label>
+            <input
+              id="workspace-name"
+              type="text"
+              className="settings-input"
+              placeholder="e.g. Studio Folio, Research Desk"
+              value={workspaceName}
+              onChange={(e) => setWorkspaceName(e.target.value)}
+            />
+            <span className="settings-field-hint">A short name for this working room, shown in the sidebar.</span>
+          </div>
+
+          <div className="settings-field">
+            <label className="settings-field-label" htmlFor="agent-personality">
+              Agent personality
+            </label>
+            <textarea
+              id="agent-personality"
+              className="settings-textarea"
+              placeholder="How should I'm Snappy behave? Tone, rigor, verbosity, whether it proactively suggests next steps…"
+              value={agentPersonality}
+              onChange={(e) => setAgentPersonality(e.target.value)}
+            />
+            <span className="settings-field-hint">Shapes the agent's voice and working style across every conversation.</span>
+          </div>
+
+          <div className="settings-field">
+            <button type="button" className="api-key-save flex items-center gap-2 mt-2" onClick={handleSaveProfile}>
+              <Save size={13} />
+              Save profile
+            </button>
+            <span className="settings-field-hint mt-2">Saved on this device; the agent reads it when forming responses.</span>
+          </div>
         </section>
 
         {/* Preferences */}

@@ -1,167 +1,243 @@
 /**
- * I’m Snappy — Library page
- * Editorial off-white asset cabinet backed by signed storage uploads and private API records.
+ * I'm Snappy — Library page
+ * Generated-assets storage: documents, images, audio, video, and files.
+ * Editorial off-white canvas, warm ink type.
  */
 import { useEffect, useRef, useState } from "react";
-import { Captions, Download, FileText, FolderOpen, Image, LoaderCircle, Music, Trash2, Upload, Video } from "lucide-react";
+import { FileText, Image, Music, Video, FolderOpen, Download, Trash2, Upload } from "lucide-react";
 import { toast } from "sonner";
 import DiscoverLayout from "@/components/DiscoverLayout";
-import { type ArtifactType, type LibraryArtifact } from "@/lib/api";
-import { useApiSession } from "@/contexts/ApiSessionContext";
+import { listAssets, addAsset, removeAsset, type LibraryAsset } from "@/lib/localStore";
+import { trpc } from "@/lib/trpc";
 
-const typeIcons: Record<ArtifactType, typeof FileText> = {
+const MAX_PREVIEW_BYTES = 1.5 * 1024 * 1024;
+
+const typeIcons = {
   document: FileText,
   image: Image,
   audio: Music,
   video: Video,
-  file: FolderOpen,
-  transcript: FileText,
+  other: FolderOpen,
 };
 
-const previewClasses: Record<ArtifactType, string> = {
+const previewClasses = {
   document: "library-preview-doc",
   image: "library-preview-image",
   audio: "library-preview-audio",
   video: "library-preview-video",
-  file: "library-preview",
-  transcript: "library-preview-doc",
+  other: "library-preview",
 };
 
-const filters: Array<{ key: "all" | ArtifactType; label: string }> = [
+const filters = [
   { key: "all", label: "All" },
   { key: "document", label: "Documents" },
   { key: "image", label: "Images" },
   { key: "audio", label: "Audio" },
   { key: "video", label: "Video" },
-  { key: "transcript", label: "Transcripts" },
-  { key: "file", label: "Files" },
-];
+  { key: "other", label: "Files" },
+] as const;
 
-function inferAssetType(file: File): Exclude<ArtifactType, "transcript"> {
+function classify(file: File): LibraryAsset["type"] {
   if (file.type.startsWith("image/")) return "image";
   if (file.type.startsWith("audio/")) return "audio";
   if (file.type.startsWith("video/")) return "video";
-  if (file.type === "application/pdf" || file.type.startsWith("text/") || file.type.includes("document")) return "document";
-  return "file";
+  if (file.type.startsWith("text/") || /\.(txt|md|pdf|docx?|csv|json)$/.test(file.name.toLowerCase())) return "document";
+  return "other";
 }
 
-function formatBytes(bytes?: number): string {
-  if (!bytes) return "Stored asset";
+function humanSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function formatDate(value: string): string {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "Recently" : date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+function localDate(iso: string): string {
+  const date = new Date(iso);
+  return date.toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
 
 export default function LibraryPage() {
-  const { api, session } = useApiSession();
-  const [activeFilter, setActiveFilter] = useState<"all" | ArtifactType>("all");
-  const [artifacts, setArtifacts] = useState<LibraryArtifact[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [transcribingId, setTranscribingId] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const { data: me } = trpc.auth.me.useQuery(undefined, { retry: 0 });
+  const isSignedIn = Boolean(me?.openId);
+  const utils = trpc.useUtils();
+  const { data: serverAssets } = trpc.library.list.useQuery(undefined, { enabled: isSignedIn, retry: 0 });
+  const addLibraryRow = trpc.library.add.useMutation({ onSuccess: () => utils.library.list.invalidate() });
+  const removeLibraryRow = trpc.library.remove.useMutation({ onSuccess: () => utils.library.list.invalidate() });
 
-  const refresh = async () => {
-    if (!api.configured || !session) return;
-    setLoading(true);
-    try {
-      const { artifacts: nextArtifacts } = await api.listArtifacts();
-      setArtifacts(nextArtifacts);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not load the Library.");
-    } finally {
-      setLoading(false);
+  const [assets, setAssets] = useState<LibraryAsset[]>([]);
+  useEffect(() => {
+    if (serverAssets && isSignedIn) {
+      setAssets(
+        serverAssets.map((row) => ({
+          id: row.id,
+          type: (row.kind === "image" || row.kind === "audio" || row.kind === "video" || row.kind === "document" ? row.kind : "other") as LibraryAsset["type"],
+          name: row.name,
+          size: row.sizeBytes ?? 0,
+          url: row.url,
+          createdAt: row.createdAt,
+        })),
+      );
+    } else {
+      setAssets(listAssets());
     }
+  }, [serverAssets, isSignedIn]);
+
+  const [activeFilter, setActiveFilter] = useState<string>("all");
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  const filtered = assets.filter((asset) => activeFilter === "all" || asset.type === activeFilter);
+
+  const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (files.length === 0) return;
+    for (const file of files) {
+      const assetType = classify(file);
+      const assetId = `asset-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const asset: LibraryAsset = {
+        id: assetId,
+        type: assetType,
+        name: file.name,
+        size: file.size,
+        createdAt: new Date().toISOString(),
+      };
+      if (file.size <= MAX_PREVIEW_BYTES) {
+        asset.dataUrl = await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = () => resolve(undefined);
+          reader.readAsDataURL(file);
+        });
+      }
+      if (isSignedIn) {
+        try {
+          const base64 = await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as string);
+            reader.onerror = () => reject(new Error("read failed"));
+            reader.readAsDataURL(file);
+          });
+          const uploaded = await fetch("/api/library/upload", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ fileName: file.name, mimeType: file.type || "application/octet-stream", kind: assetType, data: base64 }),
+          });
+          if (!uploaded.ok) throw new Error(`Upload failed (${uploaded.status})`);
+          const { url, sizeBytes } = (await uploaded.json()) as { url: string; sizeBytes: number };
+          addLibraryRow.mutate({
+            publicId: assetId,
+            name: file.name,
+            kind: assetType,
+            mimeType: file.type || undefined,
+            url,
+            sizeBytes: sizeBytes ?? file.size,
+          });
+          asset.url = url;
+          asset.size = sizeBytes ?? file.size;
+        } catch (error) {
+          console.error("[Library] server upload failed, keeping local copy", error);
+          addAsset(asset);
+          toast.error("Could not store the file in the cloud.", { description: "It is saved on this device instead." });
+        }
+      } else {
+        addAsset(asset);
+      }
+      setAssets(isSignedIn ? (prev) => [asset, ...prev] : listAssets());
+    }
+    toast.message(`${files.length} item${files.length > 1 ? "s" : ""} added to Library.${isSignedIn ? " Stored in the cloud." : " Stored locally on this device — visible in the preview only."}`);
   };
 
-  useEffect(() => { void refresh(); }, [api, session]);
-
-  const handleFile = async (file?: File) => {
-    if (!file) return;
-    if (!session) { toast.error("Sign in in Settings before uploading to your Library."); return; }
-    setUploading(true);
-    try {
-      const artifact = await api.uploadArtifact(file, inferAssetType(file));
-      setArtifacts((current) => [artifact, ...current]);
-      toast.success(`${file.name} is now in your Library.`);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not upload this asset.");
-    } finally {
-      setUploading(false);
-      if (inputRef.current) inputRef.current.value = "";
+  const handleDownload = (asset: LibraryAsset) => {
+    const href = asset.url ?? asset.dataUrl;
+    if (!href) {
+      toast.message(`${asset.name} has no stored preview.`, {
+        description: "Only files under 1.5 MB keep a local preview in this prototype.",
+      });
+      return;
     }
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = asset.name;
+    link.click();
   };
 
-  const handleDelete = async (artifact: LibraryArtifact) => {
-    try {
-      await api.deleteArtifact(artifact.id);
-      setArtifacts((current) => current.filter((item) => item.id !== artifact.id));
-      toast.message(`${artifact.name} removed from Library.`);
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not remove this asset.");
-    }
+  const handleDelete = (asset: LibraryAsset) => {
+    if (isSignedIn) removeLibraryRow.mutate({ publicId: asset.id });
+    removeAsset(asset.id);
+    setAssets(isSignedIn ? (prev) => prev.filter((row) => row.id !== asset.id) : listAssets());
+    toast.message(`${asset.name} removed from Library.`, { description: isSignedIn ? "Deleted from the cloud." : "Deleted from this device." });
   };
-
-  const handleTranscribe = async (artifact: LibraryArtifact) => {
-    if (!artifact.secureUrl) { toast.error("This asset is not available for transcription."); return; }
-    try {
-      setTranscribingId(artifact.id);
-      const source = await fetch(artifact.secureUrl);
-      if (!source.ok) throw new Error("Could not retrieve the stored media for transcription.");
-      const blob = await source.blob();
-      const result = await api.transcribeMedia(new File([blob], artifact.name, { type: artifact.contentType }));
-      setArtifacts((current) => [result.artifact, ...current]);
-      toast.success("Transcript saved to Library.", { description: result.transcript.text ? "A text transcript is ready for your agent workflows." : "The transcription provider completed the request." });
-    } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not transcribe this asset.");
-    } finally {
-      setTranscribingId(null);
-    }
-  };
-
-  const filtered = artifacts.filter((asset) => activeFilter === "all" || asset.type === activeFilter);
 
   return (
     <DiscoverLayout page="library">
-      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+      <div className="flex items-center justify-between gap-4">
         <div className="library-filter-tabs">
-          {filters.map((filter) => <button key={filter.key} type="button" onClick={() => setActiveFilter(filter.key)} className={`library-filter-tab ${activeFilter === filter.key ? "library-filter-tab-active" : ""}`}>{filter.label}</button>)}
+        {filters.map((filter) => (
+          <button
+            key={filter.key}
+            type="button"
+            onClick={() => setActiveFilter(filter.key)}
+            className={`library-filter-tab ${activeFilter === filter.key ? "library-filter-tab-active" : ""}`}
+          >
+            {filter.label}
+          </button>
+        ))}
         </div>
-        <label className="api-key-save flex cursor-pointer items-center gap-2">
-          {uploading ? <LoaderCircle size={14} className="animate-spin" /> : <Upload size={14} />}
-          {uploading ? "Uploading" : "Upload asset"}
-          <input ref={inputRef} className="sr-only" type="file" disabled={uploading} onChange={(event) => void handleFile(event.target.files?.[0])} />
-        </label>
+        <button type="button" className="api-key-save flex items-center gap-2" onClick={() => inputRef.current?.click()}>
+          <Upload size={13} /> Add file
+        </button>
+        <input ref={inputRef} type="file" multiple className="hidden" onChange={handleUpload} aria-label="Upload a file to the Library" />
       </div>
 
-      {!api.configured && <p className="mb-6 text-[13px] text-[#8a857d]">Set <code>VITE_API_BASE_URL</code> to connect this Library to your I’m Snappy service.</p>}
-      {api.configured && !session && <p className="mb-6 text-[13px] text-[#8a857d]">Sign in through Settings to access your private Library.</p>}
-      {loading && <div className="flex items-center gap-2 py-10 text-[13px] text-[#8a857d]"><LoaderCircle size={15} className="animate-spin" /> Loading Library…</div>}
-
-      {!loading && session && <div className="library-grid">
+      <div className="library-grid">
         {filtered.map((asset) => {
           const Icon = typeIcons[asset.type];
-          return <div key={asset.id} className="library-card">
-            <div className={`library-preview ${previewClasses[asset.type]}`}><Icon size={28} strokeWidth={1.5} /></div>
-            <div className="library-card-info">
-              <span className="library-card-name">{asset.name}</span>
-              <span className="library-card-meta">{formatBytes(asset.bytes)} · {formatDate(asset.createdAt)}</span>
-              <div className="mt-2 flex items-center gap-2">
-                {asset.secureUrl && <button type="button" onClick={() => window.open(asset.secureUrl, "_blank", "noopener,noreferrer")} className="icon-button h-7 w-7" aria-label={`Download ${asset.name}`}><Download size={13} /></button>}
-                {(asset.type === "audio" || asset.type === "video") && <button type="button" disabled={transcribingId === asset.id} onClick={() => void handleTranscribe(asset)} className="icon-button h-7 w-7" aria-label={`Transcribe ${asset.name}`}>{transcribingId === asset.id ? <LoaderCircle size={13} className="animate-spin" /> : <Captions size={13} />}</button>}
-                <button type="button" onClick={() => void handleDelete(asset)} className="icon-button h-7 w-7" aria-label={`Delete ${asset.name}`}><Trash2 size={13} /></button>
+          return (
+            <div key={asset.id} className="library-card">
+              <div className={`library-preview ${previewClasses[asset.type]}`}>
+                {asset.type === "image" && asset.dataUrl ? (
+                  <img src={asset.dataUrl} alt={asset.name} className="h-full w-full object-cover" />
+                ) : (
+                  <Icon size={28} strokeWidth={1.5} />
+                )}
+              </div>
+              <div className="library-card-info">
+                <span className="library-card-name">{asset.name}</span>
+                <span className="library-card-meta">
+                  {humanSize(asset.size)} · {localDate(asset.createdAt)}
+                </span>
+                <div className="mt-2 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleDownload(asset)}
+                    className="icon-button h-7 w-7"
+                    aria-label={`Download ${asset.name}`}
+                  >
+                    <Download size={13} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleDelete(asset)}
+                    className="icon-button h-7 w-7"
+                    aria-label={`Delete ${asset.name}`}
+                  >
+                    <Trash2 size={13} />
+                  </button>
+                </div>
               </div>
             </div>
-          </div>;
+          );
         })}
-      </div>}
+      </div>
 
-      {!loading && session && filtered.length === 0 && <p className="mt-12 text-center text-[13px] text-[#8a857d]">Nothing stored in this category yet. Upload an asset or save one from an agent run.</p>}
+      {filtered.length === 0 && (
+        <div className="folio-empty-state mt-10">
+          <span className="folio-empty-index">Shelf 01</span>
+          <FolderOpen size={24} strokeWidth={1.35} />
+          <p className="folio-empty-title">A clear shelf makes room for the next useful thing.</p>
+          <p className="folio-empty-copy">Add a file to keep it close at hand in this browser, or connect the backend when you are ready to keep it in the cloud.</p>
+        </div>
+      )}
     </DiscoverLayout>
   );
 }
